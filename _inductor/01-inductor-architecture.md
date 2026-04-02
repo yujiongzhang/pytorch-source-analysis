@@ -44,24 +44,7 @@ def compile(
 
 **文件**: `torch/_dynamo/eval_frame.py`
 
-```python
-# torch/_dynamo/eval_frame.py: L148
-cached_backends: dict[int, CompilerFn] = {}
-
-# L171-193: DynamoStance 配置
-@dataclass
-class DynamoStance:
-    stance: str = "default"
-    skip_guard_eval_unsafe: bool = False
-    backend: Union[str, Callable[..., Any], None] = None
-
-# L181: 设置编译姿态
-def _set_stance(stance: DynamoStance) -> DynamoStance:
-    global _stance
-    from torch._C._dynamo.eval_frame import get_eval_frame_callback
-    callback = get_eval_frame_callback()
-    # ... 设置编译上下文
-```
+Dynamo 通过字节码捕获生成 FX Graph，详细实现参考 `torch/_dynamo/eval_frame.py` 和 `torch/_dynamo/convert_frame.py`。
 
 #### 第三步：Inductor 后端注册
 
@@ -79,11 +62,12 @@ def inductor(*args: Any, **kwargs: Any) -> Any:
         # 延迟导入，避免不必要的内存加载
         # 预热异步编译进程池
         from torch._inductor.async_compile import maybe_warm_pool
+
         maybe_warm_pool()
-        
+
         # 导入核心编译函数
         from torch._inductor.compile_fx import compile_fx
-    
+
     return compile_fx(*args, **kwargs)
 ```
 
@@ -154,6 +138,8 @@ graph TB
     end
 ```
 
+**核心编译函数**: `compile_fx_inner` 位于 `torch/_inductor/compile_fx.py:787`
+
 ---
 
 ## 3. Inductor 核心组件详解
@@ -176,7 +162,7 @@ graph TB
 **文件**: `torch/_inductor/graph.py`
 
 ```python
-# torch/_inductor/graph.py: L343-L497
+# torch/_inductor/graph.py: L344
 class GraphLowering(torch.fx.Interpreter):
     """
     将 FX Graph 转换为 Inductor IR 的核心类
@@ -192,7 +178,7 @@ class GraphLowering(torch.fx.Interpreter):
     ) -> None:
         super().__init__(gm)
         
-        # L388-391: 形状环境初始化
+        # L387-391: 形状环境初始化
         if shape_env is None:
             shape_env = ShapeEnv()
             self.reuse_shape_env = False
