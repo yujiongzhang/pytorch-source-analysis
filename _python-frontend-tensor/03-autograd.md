@@ -1,710 +1,653 @@
-# 03. Autograd 自动微分系统
+# Python 层 Tensor API（三）：自动微分集成
 
-> 本文档深入解析 PyTorch 自动微分系统的实现原理，包括计算图构建、反向传播引擎和梯度管理模式
+> **前序**: [Part 2 - Tensor 构造与工厂函数](./02-tensor-creation.md)
+> **核心源码**: `torch/csrc/autograd/engine.cpp`, `torch/csrc/autograd/python_engine.cpp`, `torch/autograd/__init__.py`
 
 ---
 
-## 01. Autograd 概述
+## 1. Autograd 架构概览
 
-### 1.1 Autograd 的位置
-
-Autograd 是 PyTorch 的自动微分引擎，位于 Python 前端与 C++ 核心之间：
+### 1.1 整体架构
 
 ```
-用户代码 (Tensor 操作)
-    ↓
-┌─────────────────────────────────────┐
-│  Python 层 (torch/autograd/)        │
-│  - grad_mode.py (梯度模式)          │
-│  - function.py (Function 基类)       │
-│  - variable.py (Variable 包装)       │
-│  - gradcheck.py (梯度检查)          │
-├─────────────────────────────────────┤
-│  C++ 层 (torch/csrc/autograd/)      │
-│  - engine.cpp (反向传播引擎)         │
-│  - variable.h (Variable C++ 定义)    │
-│  - function.h (Function C++ 定义)    │
-│  - graph_task.h (计算图任务)         │
-└─────────────────────────────────────┘
-    ↓
-ATen 算子执行
+┌─────────────────────────────────────────────────────────┐
+│              Python 层 (torch.autograd)                   │
+│  - backward()                                            │
+│  - grad()                                                │
+│  - Function 类                                           │
+│  - grad_mode (enable_grad/no_grad/inference_mode)        │
+└─────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────┐
+│              C++ 绑定层 (torch/csrc/autograd)            │
+│  - python_engine.cpp - PythonEngine 实现                  │
+│  - python_variable.cpp - Variable 绑定                    │
+│  - python_cpp_function.cpp - C++ Function 绑定            │
+└─────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────┐
+│              C++ 引擎层 (torch/csrc/autograd)            │
+│  - engine.cpp - 反向传播引擎                              │
+│  - function.cpp - Autograd Function 基类                  │
+│  - variable.cpp - Variable 实现                          │
+└─────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────┐
+│              ATen 层 (aten/src/ATen)                     │
+│  - derivatives.yaml - 导数公式定义                        │
+│  - AutogradComposite.cpp - 复合实现                       │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ### 1.2 核心概念
 
-| 概念 | 说明 | 源码位置 |
-|------|------|----------|
-| `Tensor` | 带自动微分能力的张量 | `torch/_tensor.py` |
-| `Variable` | Tensor 的包装类（历史遗留） | `torch/autograd/variable.py` |
-| `Function` | 自动微分函数基类 | `torch/autograd/function.py` |
-| `grad_fn` | 创建 Tensor 的函数引用 | C++ 属性 |
-| `GraphTask` | 一次反向传播任务 | `torch/csrc/autograd/graph_task.h` |
-| `Engine` | 反向传播引擎 | `torch/csrc/autograd/engine.cpp` |
+| 概念 | 说明 |
+|------|------|
+| **Variable** | 包装 Tensor，追踪计算历史 |
+| **Function** | 计算图中的节点，定义前向和反向计算 |
+| **Edge** | 连接 Function 的边，包含梯度和连接信息 |
+| **GraphTask** | 一次反向传播任务的状态 |
+| **ReadyQueue** | 待执行的 Function 队列 |
+| **InputBuffer** | 累积输入梯度的缓冲区 |
 
 ---
 
-## 02. 梯度管理模式
+## 2. Python 层 API
 
-### 2.1 is_grad_enabled 全局状态
+### 2.1 torch.autograd.backward()
 
-**源码位置**: `torch/__init__.py` (C++ 绑定)
-
-```python
-# 全局梯度计算开关
-torch.is_grad_enabled()  # bool
-torch.set_grad_enabled(True/False)  # None
-```
-
-### 2.2 no_grad 上下文管理器
-
-**源码位置**: `torch/autograd/grad_mode.py:21-86`
+**源码**: `torch/autograd/__init__.py` (L230-L300)
 
 ```python
-class no_grad(_NoParamDecoratorContextManager):
-    r"""
-    禁用梯度计算的上下文管理器
-    
-    适用于推理阶段，减少内存消耗
-    
-    Example::
-        >>> x = torch.tensor([1.], requires_grad=True)
-        >>> with torch.no_grad():
-        ...     y = x * 2  # y.requires_grad = False
-        >>> y.requires_grad
-        False
-    """
-    
-    def __init__(self) -> None:
-        if not torch._jit_internal.is_scripting():
-            super().__init__()
-        self.prev = False
-    
-    def __enter__(self) -> None:
-        self.prev = torch.is_grad_enabled()
-        torch.set_grad_enabled(False)
-    
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        torch.set_grad_enabled(self.prev)
-```
+def backward(
+    tensors: _TensorOrTensorsOrGradEdge,
+    grad_tensors: _TensorOrOptionalTensors = None,
+    retain_graph: Optional[bool] = None,
+    create_graph: bool = False,
+    grad_variables: Optional[_TensorOrOptionalTensors] = None,
+    inputs: Optional[_TensorOrTensorsOrGradEdge] = None,
+) -> None:
+    r"""Computes the sum of gradients of given tensors with respect to graph leaves.
 
-**实现细节**:
-- 使用 `_NoParamDecoratorContextManager` 基类
-- 同时支持上下文管理器 (`with`) 和装饰器 (`@torch.no_grad()`)
-- 线程局部状态，不影响其他线程
-
-### 2.3 enable_grad 上下文管理器
-
-**源码位置**: `torch/autograd/grad_mode.py:88-141`
-
-```python
-class enable_grad(_NoParamDecoratorContextManager):
-    r"""
-    启用梯度计算的上下文管理器
-    
-    用于在 no_grad 环境中临时启用梯度计算
-    
-    Example::
-        >>> x = torch.tensor([1.], requires_grad=True)
-        >>> with torch.no_grad():
-        ...     with torch.enable_grad():
-        ...         y = x * 2  # y.requires_grad = True
-        >>> y.requires_grad
-        True
-    """
-    
-    def __enter__(self) -> None:
-        self.prev = torch.is_grad_enabled()
-        torch._C._set_grad_enabled(True)
-    
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        torch._C._set_grad_enabled(self.prev)
-```
-
-### 2.4 set_grad_enabled 上下文管理器
-
-**源码位置**: `torch/autograd/grad_mode.py:143-200`
-
-```python
-class set_grad_enabled(_DecoratorContextManager):
-    r"""
-    根据参数设置梯度计算开关
-    
     Args:
-        mode (bool): True 启用，False 禁用
-    
-    Example::
-        >>> is_train = False
-        >>> with torch.set_grad_enabled(is_train):
-        ...     y = x * 2
+        tensors (Tensor or sequence of Tensors or GradientEdge): Tensors of which
+            the derivative will be computed. GradientEdge is an output of a
+            differentiable function with the corresponding output index that
+            the derivative will be computed.
+        grad_tensors (Tensor or sequence of Tensors, optional): The "vector"
+            in the Jacobian-vector product. Usually gradients w.r.t.
+            each element of corresponding tensors.
+        retain_graph (bool, optional): If ``False``, the graph used to compute
+            the grads will be freed. Defaults to ``None``.
+        create_graph (bool, optional): If ``True``, graph of the derivative will
+            be constructed, allowing to compute higher order derivative products.
+            Defaults to ``False``.
+        inputs (Tensor or sequence of Tensors or GradientEdge, optional): Inputs
+            w.r.t. which the gradient will be accumulated into .grad.
     """
-    
-    def __init__(self, mode: bool) -> None:
-        self.prev = torch.is_grad_enabled()
-        self.mode = mode
-        torch._C._set_grad_enabled(mode)
-    
-    def __enter__(self) -> None:
-        torch._C._set_grad_enabled(self.mode)
-    
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        torch._C._set_grad_enabled(self.prev)
+    # 处理 grad_variables 废弃参数
+    if grad_variables is not None:
+        warnings.warn(...)
+        grad_tensors = grad_variables
+
+    # 统一处理为序列
+    tensors = (tensors,) if isinstance(tensors, (torch.Tensor, graph.GradientEdge)) else tensors
+
+    # 创建 grad_tensors
+    if grad_tensors is None:
+        # 为每个输出创建全 1 梯度
+        grad_tensors = torch._C._engine_base._make_default_grads(tensors)
+    elif isinstance(grad_tensors, torch.Tensor):
+        grad_tensors = (grad_tensors,)
+
+    # 执行反向传播
+    torch.autograd.graph._engine_run_backward(
+        tensors=tensors,
+        grad_tensors=grad_tensors,
+        retain_graph=retain_graph,
+        create_graph=create_graph,
+        inputs=inputs,
+        allow_unreachable=False,
+        accumulate_grad=True
+    )
 ```
 
-### 2.5 inference_mode 上下文管理器
+### 2.2 torch.autograd.grad()
 
-**源码位置**: C++ 实现 (`torch/csrc/autograd/InferenceMode.h`)
+**源码**: `torch/autograd/__init__.py` (L350-L450)
 
 ```python
-class inference_mode:
-    r"""
-    推理模式 - 比 no_grad 更严格的梯度禁用模式
-    
-    与 no_grad 的区别:
-    - 不仅禁用梯度，还禁用 Autograd 引擎的其他开销
-    - 允许更多优化（如原地操作检查放宽）
-    - 性能略优于 no_grad
-    
-    适用场景：纯推理，不需要任何梯度相关功能
-    """
-    pass
+def grad(
+    outputs: _TensorOrTensorsOrGradEdge,
+    inputs: _TensorOrTensorsOrGradEdge,
+    grad_outputs: _TensorOrOptionalTensors = None,
+    retain_graph: Optional[bool] = None,
+    create_graph: bool = False,
+    only_inputs: bool = True,
+    allow_unused: bool = False,
+    is_grads_batched: bool = False,
+    materialize_grads: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    r"""Computes and returns the sum of gradients of outputs with respect to inputs.
 
-# 使用示例
-with torch.inference_mode():
-    output = model(input)
+    Returns:
+        A tuple of gradients w.r.t. each input.
+    """
+    inputs = (inputs,) if isinstance(inputs, (torch.Tensor, graph.GradientEdge)) else inputs
+    outputs = (outputs,) if isinstance(outputs, (torch.Tensor, graph.GradientEdge)) else outputs
+
+    if grad_outputs is None:
+        grad_outputs = torch._C._engine_base._make_default_grads(outputs)
+    elif isinstance(grad_outputs, torch.Tensor):
+        grad_outputs = (grad_outputs,)
+
+    # 执行反向传播并返回梯度
+    return torch.autograd.graph._engine_run_backward(
+        tensors=outputs,
+        grad_tensors=grad_outputs,
+        retain_graph=retain_graph,
+        create_graph=create_graph,
+        inputs=inputs,
+        allow_unreachable=allow_unused,
+        accumulate_grad=False
+    )
+```
+
+### 2.3 _engine_run_backward()
+
+**源码**: `torch/autograd/graph.py`
+
+```python
+def _engine_run_backward(
+    *,
+    tensors,
+    grad_tensors,
+    retain_graph,
+    create_graph,
+    inputs,
+    allow_unreachable,
+    accumulate_grad
+):
+    """调用 C++ 引擎执行反向传播"""
+    return torch._C._engine_base.run_backward(
+        tensors=tensors,
+        grad_tensors=grad_tensors,
+        keep_graph=retain_graph,
+        create_graph=create_graph,
+        inputs=inputs,
+        allow_unreachable=allow_unreachable,
+        accumulate_grad=accumulate_grad
+    )
 ```
 
 ---
 
-## 03. Function 类与自定义 Autograd
+## 3. C++ 层引擎实现
 
-### 3.1 Function 基类
+### 3.1 PythonEngine 类
 
-**源码位置**: `torch/autograd/function.py`
+**源码**: `torch/csrc/autograd/python_engine.cpp` (L35-L54)
 
-```python
-class Function(torch.autograd.function._FuncBase):
-    r"""
-    自动微分函数基类
-    
-    所有 autograd 函数都继承自 Function
-    
-    子类必须实现:
-    - forward(ctx, ...) -> Tensor: 前向计算
-    - backward(ctx, grad_output) -> Tuple[Tensor, ...]: 反向梯度计算
-    
-    Example::
-    
-        class Exp(Function):
-            @staticmethod
-            def forward(ctx, i):
-                result = i.exp()
-                ctx.save_for_backward(result)  # 保存用于 backward 的张量
-                return result
-            
-            @staticmethod
-            def backward(ctx, grad_output):
-                result, = ctx.saved_tensors
-                return grad_output * result  # d(exp(x))/dx = exp(x)
-    """
-    
-    _is_backward_hook = False
-    
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__()
-        self._forward_from_backward_fn = None
+```cpp
+namespace torch::autograd::python {
+
+PythonEngine::PythonEngine() = default;
+
+Engine& PythonEngine::get_python_engine() {
+  static PythonEngine engine;
+  if (_reinitialize_engine) {
+    engine.release_workers();
+    engine.~PythonEngine();
+    new (&engine) torch::autograd::python::PythonEngine();
+    _reinitialize_engine = false;
+  }
+  return engine;
+}
+
+// 线程初始化 - 获取 GIL
+void PythonEngine::thread_init(
+    int device,
+    const std::shared_ptr<ReadyQueue>& ready_queue,
+    bool should_increment) {
+
+  if (should_increment) {
+    increment_non_reentrant_thread_count();
+  }
+
+  // 创建 PyThreadState，但释放 GIL
+  auto gil = std::make_unique<pybind11::gil_scoped_acquire>();
+  pybind11::gil_scoped_release no_gil;
+
+  Engine::thread_init(device, ready_queue, false);
+
+  if (should_increment) {
+    decrement_non_reentrant_thread_count();
+  }
+}
+
+// 异常处理 - 保存 Python 异常状态
+void PythonEngine::thread_on_exception(
+    const std::shared_ptr<GraphTask>& graph_task,
+    const std::shared_ptr<Node>& fn,
+    std::exception& e) {
+
+  auto python_err = dynamic_cast<python_error*>(&e);
+  if (python_err) {
+    python_err->persist();  // 保存 PyErr 状态
+  }
+  Engine::thread_on_exception(graph_task, fn, e);
+}
+
+} // namespace torch::autograd::python
 ```
 
-### 3.2 自定义 Function 示例
+### 3.2 run_backward() 实现
+
+**源码**: `torch/csrc/autograd/python_engine.cpp` (L172-L280)
+
+```cpp
+static PyObject* THPEngine_run_backward(
+    PyObject* self,
+    PyObject* args,
+    PyObject* kwargs) {
+
+  PyObject* tensors = nullptr;
+  PyObject* grad_tensors = nullptr;
+  unsigned char keep_graph = 0;
+  unsigned char create_graph = 0;
+  PyObject* inputs = nullptr;
+  unsigned char allow_unreachable = 0;
+  unsigned char accumulate_grad = 0;
+
+  // 解析参数
+  if (!PyArg_ParseTupleAndKeywords(
+          args, kwargs, "OObb|Obb",
+          const_cast<char**>(accepted_kwargs),
+          &tensors, &grad_tensors, &keep_graph, &create_graph,
+          &inputs, &allow_unreachable, &accumulate_grad)) {
+    return nullptr;
+  }
+
+  // 解析输入 tensors
+  auto variables = pyobj_to_vars(tensors);
+  auto input_vars = pyobj_to_vars(inputs);
+
+  // 解析梯度
+  auto grad_variables = pyobj_to_vars(grad_tensors);
+
+  // 构建根节点边列表
+  edge_list roots(variables.size());
+  for (size_t i = 0; i < variables.size(); i++) {
+    roots[i] = Edge(variables[i].grad_fn, variables[i].output_nr);
+  }
+
+  // 执行反向传播
+  variable_list results;
+  {
+    pybind11::gil_scoped_release no_gil;  // 释放 GIL
+
+    results = python::PythonEngine::get_python_engine().execute(
+        roots,
+        grad_variables,
+        keep_graph,
+        create_graph,
+        accumulate_grad,
+        input_vars);
+  }
+
+  // 检查 Python 异常
+  if (PyErr_Occurred()) {
+    throw python_error();
+  }
+
+  // 返回结果
+  auto rg = pybind11::reinterpret_steal<PyObject*>(
+      THPVariable_WrapList(results));
+
+  return rg;
+}
+```
+
+### 3.3 Engine::execute() 核心流程
+
+**源码**: `torch/csrc/autograd/engine.cpp` (L800-L1000+)
+
+```cpp
+variable_list Engine::execute(
+    const edge_list& roots,
+    const variable_list& inputs,
+    bool keep_graph,
+    bool create_graph,
+    bool accumulate_grad,
+    const edge_list& outputs) {
+
+  // 1. 创建 GraphTask
+  auto graph_task = std::make_shared<GraphTask>(
+      roots, inputs, outputs, keep_graph, create_graph, accumulate_grad);
+
+  // 2. 初始化输入缓冲区
+  InputBuffer input_buffer(inputs.size());
+  for (size_t i = 0; i < inputs.size(); i++) {
+    if (inputs[i].defined()) {
+      input_buffer.add(input_edges[i].first, inputs[i].output_nr, inputs[i]);
+    }
+  }
+
+  // 3. 创建图根节点
+  auto graph_root = std::make_shared<GraphRoot>(roots, grad_variables);
+
+  // 4. 执行计算图
+  execute_with_graph_task(graph_task, graph_root, std::move(input_buffer));
+
+  // 5. 收集结果
+  variable_list results(outputs.size());
+  for (size_t i = 0; i < outputs.size(); i++) {
+    results[i] = graph_task->output_values_[i];
+  }
+
+  return results;
+}
+```
+
+---
+
+## 4. Function 与 Node
+
+### 4.1 Python Function 类
+
+**源码**: `torch/autograd/function.py`
+
+```python
+class Function:
+    """
+    所有 autograd Function 的基类。
+
+    子类需要实现:
+    - forward(ctx, ...) -> Tensor
+    - backward(ctx, grad_output) -> tuple of Tensors
+
+    示例:
+    >>> class Exp(Function):
+    ...     @staticmethod
+    ...     def forward(ctx, i):
+    ...         result = i.exp()
+    ...         ctx.save_for_backward(result)
+    ...         return result
+    ...     @staticmethod
+    ...     def backward(ctx, grad_output):
+    ...         result, = ctx.saved_tensors
+    ...         return grad_output * result
+    """
+
+    @staticmethod
+    def forward(ctx, *args, **kwargs):
+        raise NotImplementedError
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        raise NotImplementedError
+
+    @classmethod
+    def apply(cls, *args):
+        """执行 Function，设置 up 计算图"""
+        # 获取 back 端实现
+        backend = Function._get_backend(cls)
+
+        # 保存输入 tensor 用于检查
+        _dirty_tensors = set()
+        for arg in args:
+            if isinstance(arg, torch.Tensor) and arg.requires_grad:
+                _dirty_tensors.add(arg)
+
+        # 创建 context
+        ctx = backend.create_context()
+
+        # 执行前向计算
+        ret = cls.forward(ctx, *args)
+
+        # 设置 grad_fn
+        if isinstance(ret, torch.Tensor) and ret.requires_grad:
+            ret.grad_fn = backend
+            ret._grad_fn_ctx = ctx
+
+        return ret
+```
+
+### 4.2 C++ Node 类
+
+**源码**: `torch/csrc/autograd/function.h`
+
+```cpp
+struct TORCH_API Node : public std::enable_shared_from_this<Node> {
+  // 前向函数 (Python Function 或 C++ Function)
+  virtual variable_list apply(variable_list&& inputs) = 0;
+
+  // 访问相邻节点
+  const std::vector<Edge>& next_edges() const {
+    return next_edges_;
+  }
+
+  // 元数据
+  std::string name() const { return name_; }
+  void set_name(std::string name) { name_ = std::move(name); }
+
+  // 输入元数据 (用于形状检查)
+  struct InputMetadata {
+    at::ScalarType dtype;
+    std::vector<int64_t> shape;
+    bool is_nested_tensor;
+  };
+  std::vector<InputMetadata> _input_metadata;
+
+ protected:
+  std::vector<Edge> next_edges_;  // 指向下一个节点
+  std::string name_;              // 节点名称
+};
+```
+
+### 4.3 CppFunction - C++ 实现的 Function
+
+**源码**: `torch/csrc/autograd/python_cpp_function.cpp`
+
+```cpp
+// 将 C++ Function 包装为 Python 可调用的对象
+struct THPCppFunction {
+  PyObject_HEAD
+  std::shared_ptr<torch::autograd::Node> cdata;
+};
+
+// 绑定到 Python
+static PyTypeObject THPCppFunctionType = {
+    PyVarObject_HEAD_INIT(nullptr, 0)
+    "torch._C._Function",                    /* tp_name */
+    sizeof(THPCppFunction),                  /* tp_basicsize */
+    // ... 方法定义
+};
+```
+
+---
+
+## 5. 梯度累积机制
+
+### 5.1 InputBuffer
+
+**源码**: `torch/csrc/autograd/input_buffer.h`
+
+```cpp
+class InputBuffer {
+ public:
+  InputBuffer(size_t size) : buffer_(size) {}
+
+  // 添加梯度到缓冲区
+  void add(std::shared_ptr<Node> owner, uint32_t output_nr, at::Tensor grad) {
+    auto& slot = buffer_[owner->node_id()];
+    if (!slot.defined()) {
+      slot = grad;
+    } else {
+      // 累积梯度
+      slot = slot + grad;
+    }
+  }
+
+  // 获取累积后的梯度
+  at::Tensor get(std::shared_ptr<Node> owner, uint32_t output_nr) {
+    return buffer_[owner->node_id()];
+  }
+
+ private:
+  std::vector<at::Tensor> buffer_;
+};
+```
+
+### 5.2 梯度累积示例
 
 ```python
 import torch
 
-class MyLinearFunction(torch.autograd.Function):
-    """自定义线性层 Autograd 函数"""
-    
-    @staticmethod
-    def forward(ctx, input, weight, bias=None):
-        # 保存反向传播需要的张量
-        ctx.save_for_backward(input, weight, bias)
-        
-        # 前向计算
-        output = input @ weight.t()
-        if bias is not None:
-            output += bias
-        
-        return output
-    
-    @staticmethod
-    def backward(ctx, grad_output):
-        # 获取保存的张量
-        input, weight, bias = ctx.saved_tensors
-        
-        # 计算梯度
-        grad_input = grad_output @ weight
-        grad_weight = grad_output.t() @ input
-        grad_bias = grad_output.sum(0) if bias is not None else None
-        
-        # 返回每个输入的梯度 (None 表示该输入不需要梯度)
-        return grad_input, grad_weight, grad_bias
-
-
-# 使用方式
-def linear(input, weight, bias):
-    return MyLinearFunction.apply(input, weight, bias)
-```
-
-### 3.3 save_for_backward 与 saved_tensors
-
-**源码位置**: `torch/autograd/function.py`
-
-```python
-class Function:
-    @classmethod
-    def save_for_backward(cls, *tensors):
-        """
-        保存张量供 backward 使用
-        
-        保存的张量存储在 ctx.saved_tensors 中
-        
-        注意:
-        - 只能保存 requires_grad=True 或与计算图相关的张量
-        - 保存的张量会阻止其存储被释放
-        """
-        pass
-    
-    @property
-    def saved_tensors(self):
-        """
-        获取保存的张量元组
-        
-        如果只需要其中一个，使用 saved_tensors[0] 等
-        """
-        pass
-    
-    @property
-    def saved_variables(self):
-        """
-        (已弃用) 获取保存的 Variable 列表
-        
-        现代代码应使用 saved_tensors
-        """
-        pass
-```
-
-### 3.4 mark_dirty 与 mark_non_differentiable
-
-```python
-class Function:
-    @classmethod
-    def mark_dirty(cls, ctx, *tensors):
-        """
-        标记原地修改的张量
-        
-        如果 forward 中原地修改了某个输入，必须标记为 dirty
-        """
-        pass
-    
-    @classmethod
-    def mark_non_differentiable(cls, ctx, *tensors):
-        """
-        标记不需要微分的输出
-        
-        适用于输出中包含不需要梯度的张量（如索引）
-        """
-        pass
-```
-
-### 3.5 NestedIOFunction
-
-```python
-class NestedIOFunction(Function):
-    """
-    支持嵌套 I/O 的 Function 基类
-    
-    用于处理输入/输出为嵌套结构的场景
-    """
-    pass
-```
-
----
-
-## 04. backward 函数与反向传播引擎
-
-### 4.1 torch.autograd.backward
-
-**源码位置**: `torch/autograd/__init__.py`
-
-```python
-def backward(
-    tensors: Union[Sequence[_TensorOrTensorsOrGradEdge], _TensorOrTensorsOrGradEdge],
-    grad_tensors: Optional[Union[Sequence[_TensorOrOptionalTensors], _TensorOrOptionalTensors]] = None,
-    retain_graph: Optional[bool] = None,
-    create_graph: bool = False,
-    grad_variables: Optional[Union[Sequence[_TensorOrOptionalTensors], _TensorOrOptionalTensors]] = None,
-    inputs: Optional[Sequence[torch.Tensor]] = None,
-) -> None:
-    r"""
-    计算并累积梯度
-    
-    计算图从 given tensors 开始，反向传播到所有 requires_grad=True 的叶子节点
-    
-    Args:
-        tensors: 要微分的张量（通常是标量损失）
-        grad_tensors: 对应张量的梯度（雅可比向量积）
-        retain_graph: 是否保留计算图
-        create_graph: 是否构建导数图（用于高阶导数）
-        inputs: 指定要累积梯度的叶子节点
-    
-    Example::
-    
-        >>> x = torch.randn(3, requires_grad=True)
-        >>> y = x * 2
-        >>> while y.data.norm() < 1000:
-        ...     y = y * 2
-        >>> y.backward()
-    """
-    # 参数处理...
-    
-    # 调用 C++ 引擎
-    _engine_run_backward(
-        tensors,
-        grad_tensors_,
-        retain_graph,
-        create_graph,
-        inputs,
-        allow_unreachable=True,
-        accumulate_grad=True,
-    )
-```
-
-### 4.2 _engine_run_backward
-
-**源码位置**: `torch/autograd/graph.py`
-
-```python
-def _engine_run_backward(*args, **kwargs):
-    """
-    运行 C++ 反向传播引擎
-    
-    实际引擎实现在 torch/csrc/autograd/engine.cpp
-    """
-    pass
-```
-
-### 4.3 C++ Engine 引擎
-
-**源码位置**: `torch/csrc/autograd/engine.cpp`
-
-```cpp
-// Engine 类定义（简化版）
-class Engine {
-public:
-    // 主反向传播函数
-    std::vector<Variable> backward(
-        const edge_list& roots,
-        const variable_list& inputs,
-        bool retain_graph,
-        bool create_graph
-    );
-    
-    // 单节点反向传播
-    void execute(
-        edge_list& roots,
-        variable_list& grads,
-        bool retain_graph,
-        bool create_graph
-    );
-    
-    // 获取单例
-    static Engine& get_default_engine();
-    
-private:
-    // 计算图调度
-    void compute_sequence_numbers(...);
-    
-    // 节点执行
-    void evaluate_function(...);
-};
-```
-
-**反向传播流程**:
-
-```
-1. 构建计算图 (从 roots 向后遍历)
-       ↓
-2. 拓扑排序 (确定执行顺序)
-       ↓
-3. 计算每个节点的"入度"(依赖数)
-       ↓
-4. 使用队列执行反向传播:
-   - 将入度为 0 的节点加入就绪队列
-   - 执行节点的 grad_fn
-   - 将梯度传递给前驱节点
-   - 减少前驱节点的入度
-   - 重复直到所有节点处理完毕
-       ↓
-5. 累积梯度到叶子节点的 .grad
-```
-
----
-
-## 05. 计算图与 grad_fn
-
-### 5.1 grad_fn 属性
-
-每个由操作创建的 Tensor 都有一个 `grad_fn` 属性：
-
-```python
 x = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
-y = x * 2
-
-print(y.grad_fn)
-# 输出：<MulBackward0 object at 0x...>
-
-# grad_fn 是指向 C++ FunctionNode 的引用
-print(type(y.grad_fn))
-# 输出：<class 'torch.autograd.function.MulBackward0'>
-```
-
-### 5.2 计算图结构
-
-```python
-x = torch.tensor([1.0], requires_grad=True)
-y = x ** 2
-z = y ** 2
-w = z ** 2
-
-w.backward()
-
-# 计算图:
-# w (grad_fn=PowBackward0)
-#   ↑
-# z (grad_fn=PowBackward0)
-#   ↑
-# y (grad_fn=PowBackward0)
-#   ↑
-# x (leaf, requires_grad=True)
-```
-
-### 5.3 叶子节点
-
-```python
-x = torch.randn(3, requires_grad=True)  # 叶子节点
-y = x + 1  # 非叶子节点
-
-print(x.is_leaf)   # True
-print(y.is_leaf)   # False
-print(x.grad_fn)   # None (叶子节点没有 grad_fn)
-print(y.grad_fn)   # <AddBackward0>
-```
-
-### 5.4 retain_graph 参数
-
-```python
-x = torch.tensor([1.0], requires_grad=True)
-y = x ** 2
-z = y ** 2
 
 # 第一次反向传播
-z.backward()  # 默认 retain_graph=False，计算图被释放
+y1 = x * 2
+y1.sum().backward()
+print(x.grad)  # tensor([2., 2., 2.])
 
-# 再次反向传播会出错
-# z.backward()  # RuntimeError: Trying to backward through the graph a second time
+# 第二次反向传播 (累积)
+y2 = x * 3
+y2.sum().backward()
+print(x.grad)  # tensor([5., 5., 5.]) = [2,2,2] + [3,3,3]
 
-# 解决方案：设置 retain_graph=True
-z = y ** 2
-z.backward(retain_graph=True)  # 保留计算图
-z.backward()  # 可以再次调用
+# 清零梯度
+x.grad.zero_()
 ```
 
 ---
 
-## 06. Variable 类（历史）
+## 6. 梯度模式
 
-### 6.1 Variable 与 Tensor 的合并
+### 6.1 enable_grad / no_grad / inference_mode
 
-在 PyTorch 0.4.0 之前，`Variable` 是独立于 `Tensor` 的包装类。0.4.0 之后两者合并。
-
-**源码位置**: `torch/autograd/variable.py`
+**源码**: `torch/autograd/grad_mode.py`
 
 ```python
-# 现在的 Variable 只是 Tensor 的别名
-Variable = torch.Tensor
+class enable_grad:
+    """上下文管理器，启用梯度计算"""
+    def __enter__(self):
+        self.prev = torch.is_grad_enabled()
+        torch.set_grad_enabled(True)
 
-# 历史代码中可能看到:
-from torch.autograd import Variable
-x = Variable(torch.randn(3, requires_grad=True))
+    def __exit__(self, *args):
+        torch.set_grad_enabled(self.prev)
 
-# 现代代码:
-x = torch.randn(3, requires_grad=True)
+
+class no_grad:
+    """上下文管理器，禁用梯度计算"""
+    def __enter__(self):
+        self.prev = torch.is_grad_enabled()
+        torch.set_grad_enabled(False)
+
+    def __exit__(self, *args):
+        torch.set_grad_enabled(self.prev)
+
+
+class inference_mode:
+    """推理模式 - 比 no_grad 更严格的优化"""
+    def __init__(self, mode=True):
+        self.mode = mode
+
+    def __enter__(self):
+        self.prev = torch.is_inference_mode_enabled()
+        torch.set_inference_mode(self.mode)
+
+    def __exit__(self, *args):
+        torch.set_inference_mode(self.prev)
 ```
 
-### 6.2 遗留 API
+### 6.2 模式对比
+
+| 模式 | 梯度计算 | 版本追踪 | 内存优化 |
+|------|----------|----------|----------|
+| 默认 | 启用 | 启用 | 无 |
+| `no_grad` | 禁用 | 启用 | 中等 |
+| `inference_mode` | 禁用 | 禁用 | 最大 |
+
+---
+
+## 7. 异常检测模式
+
+### 7.1 detect_anomaly
+
+**源码**: `torch/autograd/anomaly_mode.py`
 
 ```python
-# 已弃用，但可能仍在使用
-Variable(data, requires_grad=True)  # 等价于 Tensor(data, requires_grad=True)
+class detect_anomaly:
+    """检测 autograd 中的异常 (NaN/Inf)"""
+
+    def __init__(self, mode=True):
+        self.mode = mode
+
+    def __enter__(self):
+        self.prev = torch.autograd.set_detect_anomaly(self.mode)
+
+    def __exit__(self, *args):
+        torch.autograd.set_detect_anomaly(self.prev)
+
+
+# 使用示例
+with torch.autograd.detect_anomaly():
+    x = torch.tensor([1.0], requires_grad=True)
+    y = torch.log(x - 1)  # log(0) = -inf
+    y.backward()  # 会抛出异常
+```
+
+### 7.2 C++ 实现
+
+**源码**: `torch/csrc/autograd/anomaly_mode.cpp`
+
+```cpp
+namespace torch::autograd {
+
+thread_local bool anomaly_mode_enabled = false;
+
+bool set_detect_anomaly(bool mode) {
+  bool prev = anomaly_mode_enabled;
+  anomaly_mode_enabled = mode;
+  return prev;
+}
+
+bool is_detect_anomaly_enabled() {
+  return anomaly_mode_enabled;
+}
+
+} // namespace torch::autograd
 ```
 
 ---
 
-## 07. 梯度检查工具
+## 8. 关键源码索引
 
-### 7.1 gradcheck
-
-**源码位置**: `torch/autograd/gradcheck.py`
-
-```python
-def gradcheck(
-    func,
-    inputs,
-    eps=1e-6,
-    atol=1e-5,
-    rtol=1e-5,
-    nondet_tol=0.0,
-):
-    r"""
-    使用有限差分法检查梯度计算是否正确
-    
-    Args:
-        func: 要检查的函数
-        inputs: 输入张量
-        eps: 有限差分步长
-        atol: 绝对误差容忍度
-        rtol: 相对误差容忍度
-    
-    Returns:
-        bool: 梯度是否正确
-    
-    Example::
-    
-        >>> import torch.autograd.gradcheck as gradcheck
-        >>> def f(x):
-        ...     return (x ** 2).sum()
-        >>> x = torch.randn(3, requires_grad=True, dtype=torch.double)
-        >>> gradcheck(f, x)
-        True
-    """
-    pass
-```
-
-### 7.2 gradgradcheck
-
-```python
-def gradgradcheck(
-    func,
-    inputs,
-    grad_outputs=None,
-    eps=1e-6,
-    atol=1e-5,
-    rtol=1e-5,
-):
-    r"""
-    检查高阶梯度（二阶导数）
-    
-    类似于 gradcheck，但检查的是梯度的梯度
-    """
-    pass
-```
+| 文件 | 行号 | 内容 |
+|------|------|------|
+| `torch/autograd/__init__.py` | L230-L300 | backward() 实现 |
+| `torch/autograd/__init__.py` | L350-L450 | grad() 实现 |
+| `torch/csrc/autograd/python_engine.cpp` | L172-L280 | run_backward() |
+| `torch/csrc/autograd/engine.cpp` | L800-L1000+ | Engine::execute() |
+| `torch/csrc/autograd/function.h` | - | Node 类定义 |
+| `torch/autograd/grad_mode.py` | - | 梯度模式类 |
 
 ---
 
-## 08. 异常检测模式
+## 9. 下一步
 
-### 8.1 detect_anomaly
-
-**源码位置**: `torch/autograd/anomaly_mode.py`
-
-```python
-def set_detect_anomaly(mode):
-    """
-    启用/禁用异常检测模式
-    
-    启用后，会检测:
-    - 反向传播中的 NaN/Inf
-    - 创建非法节点的函数
-    """
-    torch._C._set_detect_anomaly(mode)
-
-
-def detect_anomaly():
-    """
-    异常检测上下文管理器
-    
-    Example::
-    
-        >>> with torch.autograd.detect_anomaly():
-        ...     loss = compute_loss()
-        ...     loss.backward()
-        # 如果检测到 NaN，会抛出异常并显示创建该节点的代码位置
-    """
-    pass
-```
-
----
-
-## 09. forward_ad - 前向模式自动微分
-
-### 9.1 前向模式 vs 反向模式
-
-| 特性 | 反向模式 (默认) | 前向模式 |
-|------|----------------|----------|
-| 适用场景 | 多输入，单输出 (如损失函数) | 单输入，多输出 |
-| 效率 | O(输出维度) | O(输入维度) |
-| API | `Tensor.backward()` | `jvp()` |
-
-### 9.2 jvp (Jacobian-Vector Product)
-
-```python
-from torch.autograd import forward_ad
-
-# 计算 Jacobian-向量积
-def jvp(func, primals, tangents):
-    """
-    前向模式自动微分
-    
-    Args:
-        func: 函数
-        primals: 原始输入
-        tangents: 切向量
-    
-    Returns:
-        (primals_out, jvp)
-    """
-    pass
-```
-
----
-
-## 附录：核心源码文件索引
-
-### Python 层 (`torch/autograd/`)
-
-| 文件 | 内容 |
+| 章节 | 主题 |
 |------|------|
-| `__init__.py` | backward, gradcheck 等入口函数 |
-| `function.py` | Function 基类 |
-| `grad_mode.py` | no_grad, enable_grad 等 |
-| `gradcheck.py` | 梯度检查 |
-| `anomaly_mode.py` | 异常检测 |
-| `variable.py` | Variable 别名 |
-| `graph.py` | _engine_run_backward |
-
-### C++ 层 (`torch/csrc/autograd/`)
-
-| 文件 | 内容 |
-|------|------|
-| `engine.cpp` | 反向传播引擎 |
-| `engine.h` | Engine 类定义 |
-| `variable.h` | Variable C++ 定义 |
-| `variable.cpp` | Variable C++ 实现 |
-| `function.h` | Function C++ 定义 |
-| `graph_task.h` | GraphTask 定义 |
-| `python_function.cpp` | Python Function 绑定 |
+| [Part 4](./04-storage-memory.md) | 存储与内存管理 |
+| [Part 5](./05-factory-functions.md) | 工厂函数详解 |
+| [Part 6](./06-dispatcher.md) | 分发机制 |
 
 ---
 
-## 后续章节
-
-- [04. Storage 与内存管理](./04-storage-memory.md) - 底层存储与内存分配
-- [05. 工厂函数实现](./05-factory-functions.md) - Tensor 创建机制
+**参考资料**:
+- `torch/autograd/__init__.py` - Python autograd API
+- `torch/csrc/autograd/engine.cpp` - 反向传播引擎核心
+- `torch/csrc/autograd/python_engine.cpp` - Python 引擎绑定
+- `torch/autograd/grad_mode.py` - 梯度模式管理

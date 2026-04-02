@@ -1,695 +1,632 @@
-# 06. Dispatcher 调度系统
+# Python 层 Tensor API（六）：分发机制
 
-> 本文档深入解析 PyTorch 的 Dispatch Key 调度机制与算子注册系统
-
----
-
-## 01. Dispatcher 概述
-
-### 1.1 什么是 Dispatch
-
-Dispatch（调度）是 PyTorch 将算子调用路由到正确实现的核心机制。
-
-```
-用户调用：torch.add(a, b)
-         ↓
-    Dispatcher
-         ↓
-    检查 Dispatch Key 队列
-         ↓
-    [Autograd] → [XLA] → [CUDA] → [CPU] → [Composite]
-         ↓
-    选择正确的 Kernel 实现
-         ↓
-    执行并返回结果
-```
-
-### 1.2 Dispatch Key 层次结构
-
-**源码位置**: `torch/_C/__init__.pyi.in`
-
-```python
-# DispatchKey 枚举（部分）
-class DispatchKey(Enum):
-    # 最高优先级：调试与分析
-    Named           # 命名维度
-    FuncTorchDynamicShapeBackwards  # 动态形状反向
-    
-    # 自动微分
-    AutogradXLA     # XLA 自动微分
-    AutogradCUDA    # CUDA 自动微分
-    AutogradCPU     # CPU 自动微分
-    AutogradNestedTensor  # 嵌套张量自动微分
-    AutogradDispatchKey  # 通用自动微分
-    
-    # 设备特定后端
-    XLA             # TPU
-    CUDA            # NVIDIA GPU
-    MPS             # Apple Silicon
-    PrivateUse1     # 自定义后端
-    IPU             # Graphcore IPU
-    XPU             # Intel GPU
-    
-    # 特殊功能
-    Quantized       # 量化算子
-    SparseCsr       # 稀疏 CSR 格式
-    Sparse          # 稀疏张量
-    Mkldnn          # MKL-DNN
-    GLSL            # OpenGL 着色语言
-    
-    # 复合实现
-    CompositeExplicitAutograd  # 复合实现（带自动微分）
-    CompositeExplicitAutogradNonFunctional
-    CompositeExplicitDeviceDispatch
-    
-    # 最低优先级：回退
-    BackendSelect   # 后端选择
-    AutocastCPU     # 自动混合精度 CPU
-    AutocastCUDA    # 自动混合精度 CUDA
-    FuncTorchBatched  # 批量处理
-    FuncTorchVmap   # 向量化映射
-    
-    # 特殊
-    Meta            # 元张量（不分配内存）
-    Zero            # 零张量
-```
+> **前序**: [Part 5 - 工厂函数详解](./05-factory-functions.md)
+> **核心源码**: `torch/utils/_python_dispatch.py`, `torch/overrides.py`, `torch/_python_dispatcher.py`
 
 ---
 
-## 02. Dispatch Key 执行流程
+## 1. 分发机制概览
 
-### 2.1 完整的 Dispatch 流程
+PyTorch 提供两种 Python 层分发机制：
 
 ```
-1. 用户调用 torch.add(a, b)
-         ↓
-2. 生成初始 Dispatch Key 队列
-   [Autograd, DeviceSpecific, BackendSelect]
-         ↓
-3. Dispatcher 遍历队列
-   for key in dispatch_keys:
-       if has_kernel(key):
-           execute_kernel(key)
-           break
-         ↓
-4. 找到匹配的实现并执行
+┌─────────────────────────────────────────────────────────┐
+│              PyTorch 分发机制                            │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │  __torch_function__                             │   │
+│  │  - 重载 torch 函数 (如 torch.add)                 │   │
+│  │  - 受 NumPy __array_function__ 启发              │   │
+│  │  - 用于 Tensor 子类                              │   │
+│  └─────────────────────────────────────────────────┘   │
+│                                                         │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │  __torch_dispatch__                             │   │
+│  │  - 重载底层 ATen 操作                             │   │
+│  │  - 用于更细粒度的控制                            │   │
+│  │  - 支持 TorchDispatchMode                        │   │
+│  └─────────────────────────────────────────────────┘   │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 Dispatch Key 包含/排除机制
+### 1.1 两种机制的对比
 
-**源码位置**: `torch/_dispatch/python.py`
-
-```python
-# 启用/禁用特定 Dispatch Key
-torch._C._EnableDispatchKey(key)
-torch._C._DisableDispatchKey(key)
-
-# 上下文管理器
-with torch._C._IncludeDispatchKeyGuard(key):
-    # 包含特定 key
-    pass
-
-with torch._C._ExcludeDispatchKeyGuard(key):
-    # 排除特定 key
-    pass
-```
-
-### 2.3 DispatchKeySet
-
-**源码位置**: `torch/library.py:944-947`
-
-```python
-# 创建 DispatchKey 集合
-autocast_keyset = torch._C.DispatchKeySet(
-    torch._C.DispatchKey.AutocastCPU
-) | torch._C.DispatchKeySet(torch._C.DispatchKey.AutocastCUDA)
-
-# 在排除特定 key 的情况下执行
-with torch._C._ExcludeDispatchKeyGuard(autocast_keyset):
-    result = op(*args, **kwargs)
-```
+| 特性 | `__torch_function__` | `__torch_dispatch__` |
+|------|---------------------|---------------------|
+| 重载对象 | torch 函数 | ATen 操作 |
+| 粒度 | 粗 (函数级) | 细 (操作级) |
+| 性能 | 较慢 | 较快 |
+| 用途 | Tensor 子类 | 模式/代理 Tensor |
+| 工厂函数 | 支持 | 支持 |
+| 组合性 | 有限 | 良好 (模式栈) |
 
 ---
 
-## 03. 算子注册系统
+## 2. __torch_function__ 机制
 
-### 03.1 torch.library 模块
+### 2.1 基本概念
 
-**源码位置**: `torch/library.py`
+`__torch_function__` 允许 Tensor 子类重载 PyTorch 函数的行为。
 
-`torch.library` 提供了注册自定义算子的 API。
+**灵感来源**: NumPy 的 `__array_function__` 协议
+
+### 2.2 基本用法
 
 ```python
 import torch
-from torch.library import impl
 
-# 方法 1: 使用装饰器注册
-@impl("aten::my_op", "CPU")
-def my_op_cpu(x):
-    return x * 2
+class MyTensor(torch.Tensor):
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        """
+        拦截并自定义 torch 函数的行为。
 
-# 方法 2: 使用库对象
-my_lib = torch.library.Library("aten", "IMPL")
+        Args:
+            func: 被调用的函数 (如 torch.add)
+            types: 参与调用的所有 Tensor 子类类型
+            args: 位置参数
+            kwargs: 关键字参数
 
-@my_lib.impl("my_op", "CPU")
-def my_op_cpu(x):
-    return x * 2
+        Returns:
+            函数结果
+        """
+        if kwargs is None:
+            kwargs = {}
 
-# 方法 3: 直接注册
-my_lib.impl("my_op", my_op_cpu, "CPU")
+        # 检查是否所有类型都是当前类型的子类
+        if not all(issubclass(cls, t) for t in types):
+            return NotImplemented
+
+        # 调用原始函数
+        with torch._C.DisableTorchFunctionSubclass():
+            ret = func(*args, **kwargs)
+
+        # 将结果转换为当前类型
+        return cls._convert(ret)
+
+    @staticmethod
+    def _convert(ret, cls):
+        """将结果转换为指定类型"""
+        if cls is torch.Tensor:
+            return ret
+
+        if isinstance(ret, torch.Tensor) and not isinstance(ret, cls):
+            ret = ret.as_subclass(cls)
+
+        if isinstance(ret, (tuple, list)):
+            ret = type(ret)(cls._convert(r, cls) for r in ret)
+
+        return ret
 ```
 
-### 3.2 Library 类
+### 2.3 执行流程
 
-**源码位置**: `torch/library.py:200-400`
-
-```python
-class Library:
-    """
-    算子注册库
-    
-    Args:
-        namespace: 命名空间（如 "aten", "my_custom"）
-        kind: 注册类型 ("DEF", "IMPL", "PRIVATEUSE1")
-        _stacklevel: 堆栈级别（用于错误报告）
-    """
-    
-    def __init__(self, namespace, kind, _stacklevel=2):
-        self.namespace = namespace
-        self.kind = kind
-        self._stacklevel = _stacklevel
-    
-    def impl(
-        self,
-        name: str,
-        fn: Callable,
-        dispatch_key: str | DispatchKey,
-        *,
-        with_keyset: bool = False,
-    ):
-        """
-        注册算子实现
-        
-        Args:
-            name: 算子名称（如 "my_op.Tensor"）
-            fn: 实现函数
-            dispatch_key: DispatchKey（如 "CPU", "CUDA"）
-            with_keyset: 是否将 DispatchKeySet 作为第一个参数传入
-        
-        Example::
-            
-            lib = torch.library.Library("aten", "IMPL")
-            
-            @lib.impl("my_op", "CPU")
-            def my_op_cpu(x):
-                return x * 2
-        """
-        # 实际注册逻辑在 C++ 层
-        pass
-    
-    def define(self, schema: str):
-        """
-        定义新的算子（仅声明，不实现）
-        
-        Args:
-            schema: 算子签名（类似函数声明）
-        
-        Example::
-            
-            lib = torch.library.Library("my_namespace", "DEF")
-            lib.define("my_op(Tensor x) -> Tensor")
-        """
-        pass
-    
-    def register(self, name: str, fn: Callable, dispatch_key: str = None):
-        """
-        注册算子（define + impl 的便捷组合）
-        """
-        pass
+```
+用户调用：torch.add(my_tensor, other_tensor)
+        ↓
+检查参数是否有 __torch_function__ 方法
+        ↓
+调用：MyTensor.__torch_function__(torch.add, (MyTensor,), (my_tensor, other_tensor), {})
+        ↓
+在 __torch_function__ 中:
+  1. 检查类型兼容性
+  2. 禁用 TorchFunction 防止递归
+  3. 调用原始函数
+  4. 转换返回类型
+        ↓
+返回结果
 ```
 
-### 3.3 算子签名（Schema）
+### 2.4 handle_torch_function
+
+**源码**: `torch/overrides.py`
 
 ```python
-# Schema 格式
-# op_name(arg1: Type1, arg2: Type2) -> ReturnType
+def handle_torch_function(
+    public_api: Callable,
+    relevant_types: Iterable[Type],
+    *args,
+    **kwargs
+) -> Any:
+    """
+    处理 __torch_function__ 分发。
 
-# 示例
-lib.define("add(Tensor self, Tensor other) -> Tensor")
-lib.define("matmul(Tensor self, Tensor other) -> Tensor")
-lib.define("sum(Tensor self, int[]? dim, bool keepdim) -> Tensor")
+    当函数检测到有自定义 __torch_function__ 的参数时调用此函数。
+    """
+    # 获取实现了 __torch_function__ 的类型
+    types = tuple(type(arg) for arg in args if hasattr(type(arg), '__torch_function__'))
 
-# 类型说明
-# Tensor       - 张量
-# Tensor?      - 可选张量
-# int          - 整数
-# float        - 浮点数
-# bool         - 布尔值
-# str          - 字符串
-# int[]        - 整数列表
-# Scalar       - 标量（int 或 float）
-# Device       - 设备
-# dtype        - 数据类型
+    if not types:
+        # 没有自定义类型，调用默认实现
+        return public_api(*args, **kwargs)
+
+    # 获取第一个有 __torch_function__ 的类型
+    tensor_type = types[0]
+
+    # 调用该类型的 __torch_function__
+    result = tensor_type.__torch_function__(public_api, types, args, kwargs)
+
+    if result is NotImplemented:
+        # 如果返回 NotImplemented，尝试下一个类型
+        if len(types) > 1:
+            return handle_torch_function(public_api, types[1:], *args, **kwargs)
+        else:
+            return public_api(*args, **kwargs)
+
+    return result
+```
+
+### 2.5 has_torch_function 检查
+
+```python
+# 检查单个参数
+def has_torch_function_unary(tensor):
+    """检查单个 Tensor 是否有 __torch_function__"""
+    return type(tensor) is not Tensor and has_torch_function(tensor)
+
+# 检查多个参数
+def has_torch_function(tensors):
+    """检查多个 Tensor 中是否有 __torch_function__"""
+    for tensor in tensors:
+        if type(tensor) is not Tensor and hasattr(type(tensor), '__torch_function__'):
+            return True
+    return False
+```
+
+### 2.6 在 Python Tensor 方法中的使用
+
+**源码**: `torch/_tensor.py`
+
+```python
+class Tensor(torch._C.TensorBase):
+
+    def backward(self, gradient=None, retain_graph=None, create_graph=False, inputs=None):
+        if has_torch_function_unary(self):
+            return handle_torch_function(
+                Tensor.backward, (self,), self,
+                gradient=gradient, retain_graph=retain_graph,
+                create_graph=create_graph, inputs=inputs
+            )
+        torch.autograd.backward(
+            self, gradient, retain_graph, create_graph, inputs=inputs
+        )
+
+    def __len__(self):
+        if has_torch_function_unary(self):
+            return handle_torch_function(Tensor.__len__, (self,), self)
+        if self.dim() == 0:
+            raise TypeError("len() of a 0-d tensor")
+        return self.shape[0]
+
+    def __iter__(self):
+        # 注意：__iter__ 不进行 __torch_function__ 分发
+        # 参见 https://github.com/pytorch/pytorch/issues/54457
+        if self.dim() == 0:
+            raise TypeError("iteration over a 0-d tensor")
+        return iter(self.unbind(0))
 ```
 
 ---
 
-## 04. Python Dispatcher
+## 3. __torch_dispatch__ 机制
 
-### 4.1 enable_python_dispatcher
+### 3.1 基本概念
 
-**源码位置**: `torch/_dispatch/python.py:1-25`
+`__torch_dispatch__` 提供了更细粒度的操作重载机制，用于：
+- 创建代理 Tensor（如 FakeTensor）
+- 实现自定义分发模式
+- 追踪操作执行
+
+### 3.2 Tensor 子类实现
+
+**源码**: `torch/_tensor.py` (L1709)
 
 ```python
-__all__ = [
-    "enable_python_dispatcher",
-    "no_python_dispatcher", 
-    "enable_pre_dispatch"
-]
-
-no_python_dispatcher = torch._C._DisablePythonDispatcher
-enable_python_dispatcher = torch._C._EnablePythonDispatcher
-enable_pre_dispatch = torch._C._EnablePreDispatch
-
-
-@contextmanager
-def enable_python_dispatcher():
-    """
-    启用 Python 层的 Dispatcher
-    
-    允许在 Python 层拦截算子调用并自定义行为
-    """
-    with torch._C._EnablePythonDispatcher():
-        yield
+class Tensor(torch._C.TensorBase):
+    __torch_dispatch__ = _C._disabled_torch_dispatch_impl
 ```
 
-### 4.2 __torch_dispatch__ 协议
+默认的 `__torch_dispatch__` 被禁用，需要子类重写。
+
+### 3.3 TorchDispatchMode
+
+**源码**: `torch/utils/_python_dispatch.py`
+
+```python
+class TorchDispatchMode:
+    """
+    允许在动态作用域内重载所有 __torch_dispatch__ 可重载函数，
+    无需创建 Tensor 子类或手动修改 PyTorch API 中的函数。
+
+    使用场景:
+    1. 重载工厂函数 (不接受 Tensor 参数的函数)
+    2. 记录中间计算
+    3. 控制执行顺序
+    """
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        """
+        重载此方法以自定义操作行为。
+
+        Args:
+            func: 被调用的操作 (OpOverload)
+            types: 参与调用的所有类型
+            args: 位置参数
+            kwargs: 关键字参数
+
+        Returns:
+            操作结果
+        """
+        raise NotImplementedError
+
+    def __enter__(self):
+        global _is_in_torch_dispatch_mode
+        self.old_dispatch_mode_flags.append(_is_in_torch_dispatch_mode)
+        _is_in_torch_dispatch_mode = True
+        _push_mode(self)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        global _is_in_torch_dispatch_mode
+        _is_in_torch_dispatch_mode = self.old_dispatch_mode_flags.pop()
+        _pop_mode()
+```
+
+### 3.4 模式栈管理
+
+```python
+# 模式栈操作
+def _push_mode(mode: TorchDispatchMode) -> None:
+    """将模式推入栈中"""
+    _push_on_torch_dispatch_stack(mode)
+
+def _pop_mode() -> TorchDispatchMode:
+    """从栈中弹出模式"""
+    return _pop_torch_dispatch_stack()
+
+def _get_current_dispatch_mode() -> TorchDispatchMode | None:
+    """获取当前模式 (栈顶)"""
+    stack_len = _len_torch_dispatch_stack()
+    if stack_len > 0:
+        return _get_dispatch_stack_at(stack_len - 1)
+    return None
+
+def _get_current_dispatch_mode_stack() -> list[TorchDispatchMode]:
+    """获取整个模式栈"""
+    stack_len = _len_torch_dispatch_stack()
+    return [_get_dispatch_stack_at(i) for i in range(stack_len)]
+```
+
+### 3.5 禁用当前模式
+
+```python
+@contextlib.contextmanager
+def _disable_current_modes():
+    """临时禁用所有模式"""
+    mode_len = _len_torch_dispatch_stack()
+    old_modes = [_pop_mode() for _ in range(mode_len)]
+
+    try:
+        yield old_modes
+    finally:
+        # 恢复模式
+        for mode in reversed(old_modes):
+            _push_mode(mode)
+```
+
+---
+
+## 4. FakeTensor 与 __torch_dispatch__
+
+### 4.1 FakeTensor 概述
+
+FakeTensor 是 `__torch_dispatch__` 的典型应用，用于：
+- 形状推断（无需实际分配内存）
+- 计算图分析
+- 编译优化
+
+**源码**: `torch/_subclasses/fake_tensor.py`
+
+### 4.2 FakeTensorMode
+
+```python
+class FakeTensorMode(TorchDispatchMode):
+    """
+    将操作转换为使用 FakeTensor 的模式。
+    FakeTensor 只有 metadata（形状、dtype、device），没有实际数据。
+    """
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # 禁用缓存（可选）
+        if not self.cache_enabled:
+            return self._dispatch(func, types, args, kwargs)
+
+        # 检查缓存
+        cache_key = self._make_cache_key(func, args, kwargs)
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+
+        # 执行分发
+        result = self._dispatch(func, types, args, kwargs)
+
+        # 缓存结果
+        self.cache[cache_key] = result
+        return result
+
+    def _dispatch(self, func, types, args=(), kwargs=None):
+        # 将 FakeTensor 转换为 Meta Tensor
+        meta_args = tuple(
+            self._to_meta(a) if isinstance(a, FakeTensor) else a
+            for a in args
+        )
+        meta_kwargs = {
+            k: self._to_meta(v) if isinstance(v, FakeTensor) else v
+            for k, v in kwargs.items()
+        }
+
+        # 在 Meta 设备上执行操作
+        with torch._C.DisableTorchDispatchSubclass():
+            meta_result = func(*meta_args, **meta_kwargs)
+
+        # 将结果转换回 FakeTensor
+        return self._from_meta(meta_result)
+```
+
+### 4.3 FakeTensor 实现
+
+```python
+class FakeTensor(torch.Tensor):
+    """
+    只有 metadata 的 Tensor，用于形状推断。
+    """
+
+    def __new__(cls, elem, *, fake_device=None):
+        # 从 Meta Tensor 创建
+        if isinstance(elem, torch.Tensor):
+            # 创建 wrapper
+            r = torch.Tensor._make_wrapper_subclass(
+                cls,
+                elem.size(),
+                strides=elem.stride(),
+                storage_offset=elem.storage_offset(),
+                dtype=elem.dtype,
+                layout=elem.layout,
+                device=fake_device or elem.device,
+                requires_grad=elem.requires_grad
+            )
+            r.elem = elem  # 保存底层 Meta Tensor
+            return r
+
+    def __tensor_flatten__(self):
+        """返回内部 Tensor 名称和上下文"""
+        return ["elem"], {}
+
+    @staticmethod
+    def __tensor_unflatten__(inner_tensors, ctx, outer_size, outer_stride):
+        """从内部 Tensor 重建"""
+        elem = inner_tensors["elem"]
+        return FakeTensor(elem)
+
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        # 通过 FakeTensorMode 处理
+        mode = maybe_get_fake_mode(args[0])
+        if mode:
+            return mode.__torch_dispatch__(func, types, args, kwargs)
+        raise NotImplementedError
+```
+
+---
+
+## 5. return_and_correct_aliasing
+
+### 5.1 问题背景
+
+在 `__torch_dispatch__` 子类中，需要正确处理：
+- View 操作的存储共享
+- Inplace 操作的返回
+- Out 参数的处理
+
+### 5.2 API 使用
+
+**源码**: `torch/utils/_python_dispatch.py` (L869)
+
+```python
+def return_and_correct_aliasing(func, args, kwargs, out):
+    """
+    确保 __torch_dispatch__ 子类正确处理操作的别名行为。
+
+    处理:
+    1. View 操作：共享输入和输出 Tensor 的存储
+    2. Inplace/out 操作：直接返回输入 Tensor
+
+    Args:
+        func: OpOverload
+        args: 位置参数
+        kwargs: 关键字参数
+        out: 操作输出
+
+    Returns:
+        修正后的输出
+    """
+    # 获取 Schema 信息（缓存）
+    schema_info = get_alias_info(func)
+
+    # 1. 修正 View 操作的存储别名
+    _correct_storage_aliasing(func, schema_info, args, out)
+
+    # 2. 处理 inplace_view 操作
+    if schema_info.is_inplace_view_op:
+        mutated_args = [...]
+        with torch.utils._mode_utils.no_dispatch():
+            func(*args, **kwargs)  # 更新 metadata
+
+    # 3. 处理 inplace/out 操作
+    if schema_info.outs_write_aliases is None:
+        return out  # 无需修正
+
+    # 返回输入 Tensor 而不是新输出
+    if len(schema_info.outs_write_aliases) == 1:
+        return get_arg_from_alias(
+            schema_info.outs_write_aliases[0], schema_info, args, kwargs
+        )
+
+    # 多返回情况
+    return type(out)(
+        get_arg_from_alias(write_alias, schema_info, args, kwargs)
+        for write_alias in schema_info.outs_write_aliases
+    )
+```
+
+### 5.3 使用示例
 
 ```python
 class MyTensor(torch.Tensor):
-    """自定义 Tensor 子类，拦截算子调用"""
-    
+    @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
-        """
-        拦截所有通过此 Tensor 类型的算子调用
-        
-        Args:
-            func: 被调用的算子（OpOverload）
-            types: 所有参数的类型
-            args: 位置参数
-            kwargs: 关键字参数
-        
-        Returns:
-            算子的结果
-        """
-        print(f"Dispatching {func}")
-        
-        # 调用默认实现
-        return super().__torch_dispatch__(func, types, args, kwargs)
+        # 执行操作
+        out = func(*args, **kwargs)
 
+        # 修正别名关系
+        return return_and_correct_aliasing(func, args, kwargs, out)
+```
+
+---
+
+## 6. PythonDispatcher - 分发器演示
+
+**源码**: `torch/_python_dispatcher.py`
+
+```python
+class PythonDispatcher:
+    """
+    演示 C++ 分发器预计算工作原理的简化版本。
+
+    展示对于某个操作，在注册到不同 DispatchKey 后，
+    计算出的分发表是什么样子的。
+    """
+
+    supported_keys = [
+        # 运行时 Keys
+        "CPU", "AutogradCPU",
+        "FPGA", "AutogradOther",
+        "XLA", "AutogradXLA",
+        "Lazy", "AutogradLazy",
+        # 别名 Keys
+        "CompositeExplicitAutograd",
+        "Autograd",
+        "CompositeImplicitAutograd",
+    ]
+
+    def __init__(self):
+        # 创建测试操作
+        self.ref = C._dispatch_library("FRAGMENT", "__test__", "")
+        self.ref.def_("foo(Tensor x) -> Tensor")
+
+    def register(self, dispatchKeys):
+        """注册内核到指定 DispatchKey"""
+        for key in dispatchKeys:
+            self.ref.impl_t_t("foo", dispatch=key, debug="fn_" + key)
+
+    def dispatchTable(self):
+        """返回计算后的分发表"""
+        output = "Computed Dispatch Table\n"
+        output += "key             kernel\n"
+        output += "---------------------------\n"
+
+        table = self.rawDispatchTable()
+        for line in table.split("\n"):
+            k = line.split(":")[0]
+            if k in self.runtime_keys:
+                output += f"{k:<15} {line.split(':')[1]}\n"
+        return output
 
 # 使用示例
-x = MyTensor([1.0, 2.0, 3.0])
-y = x + 1  # 会打印 "Dispatching aten::add.Tensor"
-```
-
-### 4.3 跨引用功能化（Cross-reference Functionalization）
-
-**源码位置**: `torch/_dispatch/python.py:120-160`
-
-```python
-def make_crossref_functionalize(
-    op: torch._ops.OpOverload,
-    final_key: DispatchKey
-) -> Callable | DispatchKey:
-    """
-    创建跨引用功能化的实现
-    
-    用于验证不同 Dispatch Key 的实现是否产生一致的结果
-    """
-    from torch._subclasses.fake_tensor import FakeTensorMode
-    
-    def handler(*args, **kwargs):
-        fake_mode = FakeTensorMode()
-        
-        # 将输入转换为 FakeTensor
-        fake_args = tree_map(fake_mode.from_tensor, args)
-        
-        # 执行并比较结果
-        result = op(*fake_args, **kwargs)
-        
-        return result
-    
-    return handler
+dispatcher = PythonDispatcher()
+dispatcher.register(["CPU", "XLA", "CompositeImplicitAutograd"])
+print(dispatcher.dispatchTable())
 ```
 
 ---
 
-## 05. 常见 Dispatch Key 详解
+## 7. 实际应用示例
 
-### 5.1 Autograd 相关 Key
+### 7.1 日志记录模式
 
 ```python
-# AutogradCPU / AutogradCUDA
-# 在执行实际算子前/后记录梯度计算图
+class LoggingMode(TorchDispatchMode):
+    """记录所有操作的模式"""
 
-# 执行顺序:
-# AutogradCPU -> CPU (实际计算)
-# 反向传播时:
-# 梯度计算在 Autograd 层处理
+    def __init__(self, file=None):
+        self.file = file or sys.stdout
+        self.indent = 0
 
-# 注册 Autograd 实现
-@impl("my_op", "AutogradCPU")
-def my_op_autograd(ctx, x):
-    # 前向
-    result = my_op_impl(x)
-    
-    # 设置反向传播
-    ctx.save_for_backward(x, result)
-    return result
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # 打印操作
+        indent_str = "  " * self.indent
+        print(f"{indent_str}{func}", file=self.file)
 
-@impl("my_op", "AutogradCPU", backward=True)
-def my_op_backward(ctx, grad_output):
-    x, result = ctx.saved_tensors
-    grad_input = grad_output * 2  # 示例
-    return grad_input
+        self.indent += 1
+        try:
+            # 调用下一个模式/实现
+            result = func(*args, **kwargs)
+            return result
+        finally:
+            self.indent -= 1
+
+# 使用
+x = torch.randn(3, 4)
+with LoggingMode():
+    y = x.sin().cos().sum()
 ```
 
-### 5.2 CompositeExplicitAutograd
+### 7.2 形状追踪模式
 
 ```python
-# CompositeExplicitAutograd 用于复合实现
-# 算子被分解为其他基本算子的组合
+class ShapeTracingMode(TorchDispatchMode):
+    """只追踪形状，不执行实际计算"""
 
-# 示例：gelu 可以用基本算子实现
-@impl("gelu", "CompositeExplicitAutograd")
-def gelu_composite(x):
-    # GELU(x) = x * Φ(x) 其中 Φ 是标准正态 CDF
-    # 使用近似: GELU(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))
-    import math
-    return 0.5 * x * (1 + torch.tanh(
-        math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))
-    ))
-```
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # 转换为 Meta Tensor
+        meta_args = tuple(
+            torch.empty_like(a) if isinstance(a, torch.Tensor) else a
+            for a in args
+        )
 
-### 5.3 Meta 设备
-
-```python
-# Meta 设备用于抽象执行，不分配实际内存
-# 用于形状推导、图优化等场景
-
-@impl("my_op", "Meta")
-def my_op_meta(x):
-    # 只返回形状信息，不实际计算
-    return torch.empty_like(x, device='meta')
-
-# 使用 Meta 设备进行形状推导
-with torch.device('meta'):
-    x = torch.randn(3, 4)
-    y = my_op(x)
-    print(y.shape)  # torch.Size([3, 4])
-    print(y.data_ptr())  # 0 (没有实际内存)
-```
-
-### 5.4 Batched / Vmap
-
-```python
-# FuncTorchBatched / FuncTorchVmap
-# 用于批量处理和向量化映射
-
-from torch.func import vmap
-
-def predict(params, batch):
-    # 处理单个样本
-    return model(params, batch)
-
-# 自动向量化
-batched_predict = vmap(predict, in_dims=(None, 0))
-results = batched_predict(params, batches)  # 批量处理
-```
-
-### 5.5 Quantized（量化）
-
-```python
-# Quantized Dispatch Key 用于量化算子
-
-@impl("add", "Quantized")
-def add_quantized(x, y):
-    # 量化加法实现
-    # 处理 scale 和 zero_point
-    x_scale, x_zero = x.q_scale(), x.q_zero_point()
-    y_scale, y_zero = y.q_scale(), y.q_zero_point()
-    
-    # 量化算术
-    return torch.ops.quantized.add(x, y)
-```
-
-### 5.6 Sparse（稀疏）
-
-```python
-# Sparse Dispatch Key 用于稀疏张量
-
-@impl("mm", "Sparse")
-def mm_sparse(a, b):
-    # 稀疏矩阵乘法
-    # 只处理非零元素
-    return torch.sparse.mm(a, b)
+        # 在 Meta 设备上执行
+        with torch._C.DisableTorchDispatchSubclass():
+            return func(*meta_args, **kwargs)
 ```
 
 ---
 
-## 06. 获取与检查 Kernel
+## 8. 关键源码索引
 
-### 6.1 get_kernel
-
-**源码位置**: `torch/library.py:1551-1595`
-
-```python
-def get_kernel(
-    op: str,
-    dispatch_key: str | DispatchKey
-) -> Callable:
-    """
-    获取算子在特定 DispatchKey 上的实现
-    
-    Args:
-        op: 算子名称（如 "aten::add.Tensor"）
-        dispatch_key: DispatchKey（如 "CPU", "CUDA"）
-    
-    Returns:
-        算子实现函数
-    
-    Example::
-        
-        # 获取 CPU 实现
-        cpu_impl = torch.library.get_kernel("aten::add.Tensor", "CPU")
-        
-        # 获取 CUDA 实现
-        cuda_impl = torch.library.get_kernel("aten::add.Tensor", "CUDA")
-        
-        # 使用 DispatchKey 枚举
-        from torch._C import DispatchKey
-        cpu_impl = torch.library.get_kernel("aten::add.Tensor", DispatchKey.CPU)
-    """
-    # 实际实现从 C++ 层获取
-    pass
-```
-
-### 6.2 has_kernel
-
-```python
-def has_kernel(op: str, dispatch_key: str | DispatchKey) -> bool:
-    """
-    检查算子是否有特定 DispatchKey 的实现
-    
-    Returns:
-        bool
-    """
-    pass
-```
-
-### 6.3 检查注册状态
-
-```python
-# 查看算子的所有实现
-op = torch.ops.aten.add.default
-print(op)  # OpOverload(qualified_name='aten.add.default')
-
-# 查看所有重载
-for overload in torch.ops.aten.add.overloads():
-    print(overload)
-
-# 查看特定 DispatchKey 的实现
-for key in ['CPU', 'CUDA', 'CompositeExplicitAutograd']:
-    if torch.library.has_kernel('aten::add.Tensor', key):
-        print(f"{key}: registered")
-    else:
-        print(f"{key}: not registered")
-```
+| 文件 | 行号 | 内容 |
+|------|------|------|
+| `torch/utils/_python_dispatch.py` | L70-L266 | TorchDispatchMode 类 |
+| `torch/utils/_python_dispatch.py` | L869-L965 | return_and_correct_aliasing |
+| `torch/overrides.py` | - | handle_torch_function |
+| `torch/_tensor.py` | L1681-L1707 | __torch_function__ 实现 |
+| `torch/_subclasses/fake_tensor.py` | - | FakeTensor 实现 |
+| `torch/_python_dispatcher.py` | - | PythonDispatcher 演示 |
 
 ---
 
-## 07. 自定义算子实战
+## 总结
 
-### 7.1 定义并实现自定义算子
-
-```python
-import torch
-from torch.library import Library, impl
-
-# 1. 创建库
-my_lib = Library("my_ops", "DEF")
-
-# 2. 定义算子签名
-my_lib.define("double(Tensor x) -> Tensor")
-my_lib.define("add_scalar(Tensor x, Scalar s) -> Tensor")
-
-# 3. 实现 CPU 版本
-@impl(my_lib, "double", "CPU")
-def double_cpu(x):
-    return x * 2
-
-@impl(my_lib, "add_scalar", "CPU")
-def add_scalar_cpu(x, s):
-    return x + s
-
-# 4. 实现 CUDA 版本（如果有）
-if torch.cuda.is_available():
-    @impl(my_lib, "double", "CUDA")
-    def double_cuda(x):
-        return x * 2  # 实际应使用 CUDA kernel
-    
-    @impl(my_lib, "add_scalar", "CUDA")
-    def add_scalar_cuda(x, s):
-        return x + s
-
-# 5. 实现 Autograd 版本
-@impl(my_lib, "double", "AutogradCPU")
-def double_autograd(ctx, x):
-    result = x * 2
-    ctx.save_for_backward(x)
-    return result
-
-@impl(my_lib, "double", "AutogradCPU", backward=True)
-def double_backward(ctx, grad_output):
-    x, = ctx.saved_tensors
-    return grad_output * 2  # d(2x)/dx = 2
-
-# 6. 使用自定义算子
-from torch import my_ops
-
-x = torch.randn(3, requires_grad=True)
-y = my_ops.double(x)  # 调用自定义算子
-y.sum().backward()
-print(x.grad)  # 应该全为 2
-```
-
-### 7.2 注册 Python 实现
-
-```python
-# 使用 Python 实现（较慢，但易于开发）
-
-from torch.library import impl, PyCustomOpDef
-
-# 定义 Python 自定义算子
-lib = Library("my_lib", PyCustomOpDef)
-
-@lib.impl("my_function", "Python")
-def my_function_impl(x):
-    return torch.sigmoid(x) * x  # SiLU 激活
-
-# Python 实现自动支持 Autograd
-```
+| 机制 | 用途 | 实现位置 |
+|------|------|----------|
+| `__torch_function__` | Tensor 子类重载 | `torch/overrides.py` |
+| `__torch_dispatch__` | 细粒度操作重载 | `torch/utils/_python_dispatch.py` |
+| TorchDispatchMode | 上下文式分发 | `torch/utils/_python_dispatch.py` |
+| FakeTensor | 形状推断 | `torch/_subclasses/fake_tensor.py` |
 
 ---
 
-## 8. Dispatch 调试工具
-
-### 8.1 查看 Dispatch 日志
-
-```bash
-# 启用 Dispatch 日志
-TORCH_LOGS=dispatch python script.py
-
-# 查看详细日志
-TORCH_LOGS=graph_breaks,recompiles,dispatch python script.py
-```
-
-### 8.2 使用 Dispatcher 钩子
-
-```python
-# 注册 Dispatch 钩子
-def dispatch_hook(op, types, args, kwargs):
-    print(f"Dispatching: {op}")
-    return None  # 返回 None 让正常 Dispatch 继续
-
-# 注意：实际 API 可能随版本变化
-```
-
----
-
-## 附录：DispatchKey 完整列表
-
-**源码位置**: `torch/_C/__init__.pyi.in`
-
-```python
-# torch._C.DispatchKey 枚举值
-DispatchKey.CPU                    # CPU 实现
-DispatchKey.CUDA                   # CUDA 实现
-DispatchKey.XLA                    # TPU 实现
-DispatchKey.MPS                    # Apple Metal 实现
-DispatchKey.PrivateUse1            # 自定义后端 1
-DispatchKey.PrivateUse2            # 自定义后端 2
-DispatchKey.IPU                    # Graphcore IPU
-DispatchKey.XPU                    # Intel GPU
-DispatchKey.HPU                    # Habana Gaudi
-DispatchKey.VE                     # NEC Vector Engine
-DispatchKey.MTIA                   # Meta AI 加速器
-DispatchKey.Lazy                   # 惰性执行
-DispatchKey.Meta                   # 抽象执行（元张量）
-
-# 自动微分
-DispatchKey.AutogradCPU
-DispatchKey.AutogradCUDA
-DispatchKey.AutogradXLA
-DispatchKey.AutogradNestedTensor
-DispatchKey.AutogradDispatchKey
-
-# 复合实现
-DispatchKey.CompositeExplicitAutograd
-DispatchKey.CompositeExplicitAutogradNonFunctional
-DispatchKey.CompositeExplicitDeviceDispatch
-
-# 特殊功能
-DispatchKey.Quantized              # 量化
-DispatchKey.SparseCsr              # 稀疏 CSR
-DispatchKey.Sparse                 # 稀疏
-DispatchKey.Mkldnn                 # MKL-DNN
-DispatchKey.GLSL                   # OpenGL
-
-# 自动混合精度
-DispatchKey.AutocastCPU
-DispatchKey.AutocastCUDA
-
-# 函数式/批量处理
-DispatchKey.FuncTorchBatched       # 批量
-DispatchKey.FuncTorchVmap          # 向量化
-DispatchKey.FuncTorchGrad          # 梯度
-DispatchKey.FuncTorchDynamicShapeBackwards
-
-# 调试/分析
-DispatchKey.Named                  # 命名维度
-DispatchKey.Concrete               # 具体张量
-DispatchKey.Symbolic               # 符号执行
-
-# 回退
-DispatchKey.BackendSelect          # 后端选择
-DispatchKey.Zero                   # 零张量
-```
-
----
-
-## 后续章节
-
-- [07. Tensor 子类实战](./07-tensor-subclass.md) - 自定义 Tensor 实现
-- [08. 设备管理](./08-device-management.md) - 设备抽象与管理
+**参考资料**:
+- `torch/utils/_python_dispatch.py` - TorchDispatchMode 实现
+- `torch/overrides.py` - __torch_function__ 实现
+- `torch/_subclasses/fake_tensor.py` - FakeTensor 实现
+- `torch/_python_dispatcher.py` - 分发器演示

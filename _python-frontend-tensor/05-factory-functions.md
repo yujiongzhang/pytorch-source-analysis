@@ -1,697 +1,628 @@
-# 05. 工厂函数与 Tensor 创建
+# Python 层 Tensor API（五）：工厂函数详解
 
-> 本文档解析 PyTorch 工厂函数的实现机制与 Tensor 创建流程
-
----
-
-## 01. 工厂函数概述
-
-### 1.1 什么是工厂函数
-
-工厂函数是创建 Tensor 的函数，如 `torch.zeros()`, `torch.randn()`, `torch.ones()` 等。
-
-```python
-# 常见的工厂函数
-torch.zeros(3, 4)           # 全 0 Tensor
-torch.ones(3, 4)            # 全 1 Tensor
-torch.empty(3, 4)           # 未初始化 Tensor
-torch.randn(3, 4)           # 标准正态分布
-torch.arange(0, 10)         # 等差数列
-torch.linspace(0, 1, 5)     # 等间距数列
-torch.eye(3)                # 单位矩阵
-torch.full((3, 4), 5.0)     # 填充指定值
-```
-
-### 1.2 工厂函数的实现层次
-
-```
-用户调用 torch.zeros(3, 4)
-       ↓
-torch/_torch_docs.py (文档字符串)
-       ↓
-torch/_refs/__init__.py (引用实现)
-       ↓
-torch/_ops.py (算子注册)
-       ↓
-torch.ops.aten.zeros.default (ATen 算子)
-       ↓
-C++ 实现 (ATen)
-```
+> **前序**: [Part 4 - 存储与内存管理](./04-storage-memory.md)
+> **核心源码**: `torch/csrc/utils/tensor_new.cpp`, `aten/src/ATen/native/TensorFactories.cpp`
 
 ---
 
-## 02. 工厂函数的实现位置
+## 1. 工厂函数分类
 
-### 2.1 torch/_refs/__init__.py
+PyTorch 的工厂函数可以分为以下几类：
 
-**源码位置**: `torch/_refs/__init__.py`
-
-这是工厂函数的"引用实现"（reference implementation），使用纯 Python 编写，作为标准参考。
-
-```python
-# torch/_refs/__init__.py
-
-def zeros(*size: int, dtype=None, device=None, requires_grad=False):
-    """
-    创建全 0 Tensor
-    
-    Args:
-        size: Tensor 形状
-        dtype: 数据类型
-        device: 设备类型
-        requires_grad: 是否需要梯度
-    """
-    # 调用 ATen 算子
-    return torch.ops.aten.zeros.default(size, dtype, device, requires_grad)
-
-
-def ones(*size: int, dtype=None, device=None, requires_grad=False):
-    """创建全 1 Tensor"""
-    return torch.ops.aten.ones.default(size, dtype, device, requires_grad)
-
-
-def empty(*size: int, dtype=None, device=None, requires_grad=False):
-    """创建未初始化 Tensor"""
-    return torch.ops.aten.empty.default(size, dtype, device, requires_grad)
-
-
-def full(
-    size: int,
-    fill_value: Number,
-    dtype=None,
-    device=None,
-    requires_grad=False,
-):
-    """创建填充指定值的 Tensor"""
-    return torch.ops.aten.full.default(
-        size, fill_value, dtype, device, requires_grad
-    )
+```
+┌─────────────────────────────────────────────────────────┐
+│                  工厂函数分类                            │
+├─────────────────────────────────────────────────────────┤
+│  1. 数据创建类                                           │
+│     - torch.tensor(), torch.as_tensor()                 │
+│     - torch.from_numpy()                                │
+│                                                         │
+│  2. 内存分配类                                           │
+│     - torch.empty(), torch.empty_like()                 │
+│     - torch.zeros(), torch.zeros_like()                 │
+│     - torch.ones(), torch.ones_like()                   │
+│     - torch.full(), torch.full_like()                   │
+│                                                         │
+│  3. 序列生成类                                           │
+│     - torch.arange(), torch.linspace()                  │
+│     - torch.logspace(), torch.geomspace()               │
+│                                                         │
+│  4. 随机数类                                             │
+│     - torch.rand(), torch.randn()                       │
+│     - torch.randint(), torch.bernoulli()                │
+│                                                         │
+│  5. 张量变形类                                           │
+│     - torch.tensor.new_*() 系列                          │
+│                                                         │
+│  6. 特殊格式类                                           │
+│     - torch.eye(), torch.diag()                         │
+│     - torch.tril(), torch.triu()                        │
+└─────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 常见工厂函数列表
+---
 
-**源码位置**: `torch/_refs/__init__.py:59-150`
+## 2. 数据创建类工厂函数
+
+### 2.1 torch.tensor()
+
+**源码**: `torch/csrc/utils/tensor_new.cpp`
 
 ```python
-__all__ = [
-    # 基础工厂函数
-    "zeros",
-    "ones", 
-    "empty",
-    "full",
-    "zeros_like",
-    "ones_like",
-    "empty_like",
-    "full_like",
-    
-    # 随机数生成
-    "rand",
-    "randn",
-    "randint",
-    "randperm",
-    
-    # 序列生成
-    "arange",
-    "linspace",
-    "logspace",
-    "geometric",
-    
-    # 特殊矩阵
-    "eye",
-    "diag",
-    "diag_embed",
-    "triangular",
-    
-    # 索引相关
-    "index_add",
-    "index_copy",
-    "index_select",
-    "index_fill",
-    
-    # ... 更多函数
-]
+torch.tensor(
+    data,               # 输入数据 (列表、元组、numpy 数组等)
+    *,
+    dtype=None,         # 数据类型 (可选，默认推断)
+    device=None,        # 设备 (可选)
+    requires_grad=False,# 是否需要梯度
+    pin_memory=False,   # 是否使用页锁定内存
+) -> Tensor
 ```
 
-### 2.3 文档字符串定义
+**实现流程**:
 
-**源码位置**: `torch/_torch_docs.py`
-
-```python
-# torch/_torch_docs.py
-
-def parse_kwargs(desc):
-    """解析参数文档"""
-    regx = re.compile(r"\n\s{4}(?!\s)")
-    kwargs = [section.strip() for section in regx.split(desc)]
-    return {desc.split(" ")[0]: desc for desc in kwargs}
-
-
-# 公共参数定义
-common_args = parse_kwargs("""
-    input (Tensor): the input tensor.
-    generator (:class:`torch.Generator`, optional): a pseudorandom number generator
-    out (Tensor, optional): the output tensor.
-    memory_format (:class:`torch.memory_format`, optional): the desired memory format
-""")
-
-# 合并参数文档
-reduceops_common_args = merge_dicts(
-    common_args,
-    parse_kwargs("""
-    dtype (:class:`torch.dtype`, optional): the desired data type
-    keepdim (bool): whether the output tensor has dim retained
-""")
+```
+Python: torch.tensor([1, 2, 3])
+        ↓
+C++ : new_from_data_copy()
+        ↓
+internal_new_from_data(
+    copy_variables=True,   # 复制变量
+    copy_numpy=True,       # 复制 numpy 数据
+    type_inference=False   # 不使用类型推断
 )
-
-# 添加文档字符串到 C++ 函数
-add_docstr(
-    torch._C._VariableFunctions.randn,
-    """
-    randn(*sizes, out=None, dtype=None, layout=torch.strided, device=None, requires_grad=False) -> Tensor
-    
-    Returns a tensor filled with random numbers from a normal distribution.
-    """,
-)
+        ↓
+┌─────────────────────────────────────────┐
+│ 数据类型检查与转换                       │
+│ - Tensor → detach() + to()              │
+│ - numpy → tensor_from_numpy()           │
+│ - __cuda_array_interface__ → 转换       │
+│ - __dlpack__ → from_dlpack()            │
+│ - Storage → set_()                      │
+│ - Sequence → recursive_store()          │
+└─────────────────────────────────────────┘
+        ↓
+at::empty() 分配内存
+        ↓
+recursive_store() 递归填充数据
+        ↓
+tensor.to(device, dtype) 移动到目标设备
+        ↓
+at::lift_fresh() 提升到当前上下文
 ```
 
----
-
-## 03. _ops.py 与算子注册
-
-### 3.1 算子注册机制
-
-**源码位置**: `torch/_ops.py`
+**数据类型推断规则**:
 
 ```python
-class OpOverloadPacket:
-    """
-    算子重载包
-    
-    一个算子可能有多个重载版本（如 CPU、CUDA、Sparse 等）
-    """
-    
-    def __init__(self, qualified_name):
-        self.qualified_name = qualified_name
-        self._overloads = {}
-    
-    def __getattr__(self, overload_name):
-        """获取特定重载版本"""
-        return self._overloads.get(overload_name)
-    
-    def __call__(self, *args, **kwargs):
-        """默认调用 default 重载"""
-        return self.default(*args, **kwargs)
+# Python 标量类型映射
+0.0      → torch.float32  (默认浮点类型)
+0       → torch.int64
+True    → torch.bool
+1+2j    → torch.complex64 (默认复数类型)
 
+# 序列类型提升规则
+[1, 2.0]     → torch.float32  (int + float → float)
+[1, 2+3j]    → torch.complex64 (int + complex → complex)
+[1.0, 2+3j]  → torch.complex64 (float + complex → complex)
 
-class OpOverload:
-    """
-    算子的单个重载版本
-    
-    每个 OpOverload 对应一个具体的实现
-    """
-    
-    def __init__(self, op, overload_name):
-        self.op = op
-        self.overload_name = overload_name
-        self._schema = None
-    
-    @property
-    def _schema(self):
-        """获取算子签名"""
-        if self._schema_ is None:
-            self._schema_ = self.op.schema
-        return self._schema_
-    
-    def __call__(self, *args, **kwargs):
-        """调用算子"""
-        return op(*args, **kwargs)
+# NumPy 数组
+np.array([1, 2], dtype=np.int32) → torch.int32
 ```
 
-### 3.2 工厂函数的算子路径
+### 2.2 torch.as_tensor()
 
 ```python
-# torch.zeros 的调用链
-import torch
-
-# 1. 用户调用
-x = torch.zeros(3, 4)
-
-# 2. torch.zeros 定义（实际在 torch/_C 中）
-# torch/_C._VariableFunctions.zeros
-
-# 3. 调用 ATen 算子
-x = torch.ops.aten.zeros.default([3, 4])
-
-# 查看算子
-print(torch.ops.aten.zeros)
-# OpOverloadPacket(qualified_name='aten.zeros')
-
-print(torch.ops.aten.zeros.default)
-# OpOverloadPacket(qualified_name='aten.zeros.default')
-```
-
----
-
-## 04. 工厂函数分类详解
-
-### 4.1 值填充类
-
-```python
-# zeros - 全 0
-def zeros(*size, dtype=None, device=None, requires_grad=False):
-    return torch.ops.aten.zeros.default(size, dtype, device, requires_grad)
-
-# ones - 全 1
-def ones(*size, dtype=None, device=None, requires_grad=False):
-    return torch.ops.aten.ones.default(size, dtype, device, requires_grad)
-
-# full - 填充指定值
-def full(size, fill_value, dtype=None, device=None, requires_grad=False):
-    return torch.ops.aten.full.default(size, fill_value, dtype, device, requires_grad)
-
-# empty - 未初始化（内存中随机值）
-def empty(*size, dtype=None, device=None, requires_grad=False):
-    return torch.ops.aten.empty.default(size, dtype, device, requires_grad)
-```
-
-### 4.2 随机数生成类
-
-**源码位置**: `torch/_refs/__init__.py`
-
-```python
-def rand(
-    *size,
+torch.as_tensor(
+    data,
     dtype=None,
-    layout=None,
+    device=None
+) -> Tensor
+```
+
+**与 torch.tensor() 的区别**:
+
+| 特性 | `torch.tensor()` | `torch.as_tensor()` |
+|------|-----------------|--------------------|
+| 数据拷贝 | 总是拷贝 | 共享内存 (如果可能) |
+| NumPy 互操作 | 拷贝数据 | 零拷贝 (共享内存) |
+| 梯度追踪 | 可以设置 requires_grad | 不支持 requires_grad |
+
+**示例**:
+
+```python
+import numpy as np
+
+# numpy 数组
+np_arr = np.array([1, 2, 3])
+
+# torch.tensor() - 拷贝数据
+t1 = torch.tensor(np_arr)
+np_arr[0] = 100
+print(t1)  # tensor([1, 2, 3]) - 不受影响
+
+# torch.as_tensor() - 共享内存
+t2 = torch.as_tensor(np_arr)
+np_arr[0] = 100
+print(t2)  # tensor([100, 2, 3]) - 受影响
+```
+
+### 2.3 torch.from_numpy()
+
+```python
+torch.from_numpy(ndarray) -> Tensor
+```
+
+**特点**:
+- 与 NumPy 数组共享内存
+- 只能用于 CPU 张量
+- 修改一个会影响另一个
+
+**源码**: `torch/csrc/utils/tensor_numpy.cpp`
+
+```cpp
+// 从 NumPy 创建 Tensor
+Tensor tensor_from_numpy(PyObject* data, bool warn_if_not_writeable) {
+  // 获取 NumPy 数组信息
+  auto array = reinterpret_cast<PyArrayObject*>(data);
+  auto dtype = numpy_dtype_to_aten(PyArray_TYPE(array));
+  auto sizes = get_sizes(array);
+
+  // 获取数据指针
+  void* data_ptr = PyArray_DATA(array);
+
+  // 创建 Deleter，确保 NumPy 数组在 Tensor 销毁时被正确释放
+  py::object obj = py::reinterpret_borrow<py::object>((PyObject*)array);
+  auto deleter = [obj = std::move(obj)](void*) {};
+
+  // 创建 Storage
+  auto storage = at::Storage(
+      at::Storage::use_byte_size_t(),
+      PyArray_NBYTES(array),
+      at::DataPtr(
+          data_ptr,
+          deleter,
+          at::Device(kCPU),
+          nullptr),
+      nullptr,  // allocator
+      false);   // resizable
+
+  // 创建 Tensor
+  return at::from_storage(storage, sizes, dtype);
+}
+```
+
+---
+
+## 3. 内存分配类工厂函数
+
+### 3.1 torch.empty()
+
+```python
+torch.empty(
+    size,               # 形状 (整数或整数元组)
+    *,
+    dtype=None,
     device=None,
+    layout=torch.strided,
     requires_grad=False,
     pin_memory=False,
-):
-    """
-    均匀分布随机数 [0, 1)
-    
-    Args:
-        size: Tensor 形状
-        dtype: 数据类型
-        generator: 随机数生成器
-    """
-    return torch.ops.aten.rand.default(size, dtype, layout, device, requires_grad)
-
-
-def randn(
-    *size,
-    dtype=None,
-    layout=None,
-    device=None,
-    requires_grad=False,
-    pin_memory=False,
-):
-    """
-    标准正态分布随机数 (mean=0, std=1)
-    """
-    return torch.ops.aten.randn.default(size, dtype, layout, device, requires_grad)
-
-
-def randint(
-    low: int,
-    high: int,
-    size: int,
-    dtype=None,
-    device=None,
-    requires_grad=False,
-):
-    """
-    指定范围内的随机整数 [low, high)
-    """
-    return torch.ops.aten.randint.default(low, high, size, dtype, device, requires_grad)
-
-
-def randperm(n, dtype=None, layout=None, device=None, requires_grad=False):
-    """
-    0 到 n-1 的随机排列
-    """
-    return torch.ops.aten.randperm.default(n, dtype, layout, device, requires_grad)
+    memory_format=torch.contiguous_format
+) -> Tensor
 ```
 
-### 4.3 序列生成类
+**C++ 实现**:
 
-```python
-def arange(
-    start: Number,
-    end: Number = None,
-    step: Number = 1,
-    dtype=None,
-    layout=None,
-    device=None,
-    requires_grad=False,
-):
-    """
-    创建等差数列
-    
-    Args:
-        start: 起始值（如果 end 为 None，则为 0 到 start）
-        end: 结束值
-        step: 步长
-    
-    Example::
-        >>> torch.arange(5)
-        tensor([0, 1, 2, 3, 4])
-        >>> torch.arange(1, 10, 2)
-        tensor([1, 3, 5, 7, 9])
-    """
-    if end is None:
-        end = start
-        start = 0
-    return torch.ops.aten.arange.default(start, end, step, dtype, layout, device, requires_grad)
+```cpp
+// aten/src/ATen/native/TensorFactories.cpp
+Tensor empty_symint(
+    SymIntArrayRef size,
+    const TensorOptions& options,
+    c10::optional<MemoryFormat> memory_format = c10::nullopt) {
 
+  return at::native::empty_symint(
+      size,
+      options.layout(),
+      options.device(),
+      options.dtype(),
+      memory_format.value_or(MemoryFormat::Contiguous));
+}
 
-def linspace(
-    start: Number,
-    end: Number,
-    steps: int,
-    dtype=None,
-    layout=None,
-    device=None,
-    requires_grad=False,
-):
-    """
-    创建等间距数列
-    
-    Args:
-        start: 起始值
-        end: 结束值
-        steps: 元素数量
-    
-    Example::
-        >>> torch.linspace(0, 1, 5)
-        tensor([0.0000, 0.2500, 0.5000, 0.7500, 1.0000])
-    """
-    return torch.ops.aten.linspace.default(start, end, steps, dtype, layout, device, requires_grad)
+// CPU 实现
+Tensor empty_strided_cpu(
+    IntArrayRef size,
+    IntArrayRef stride,
+    const TensorOptions& options) {
 
+  // 1. 分配内存
+  auto storage = c10::Storage(
+      c10::Storage::use_byte_size_t(),
+      c10::compute_numel(size) * elementSize(options.dtype()),
+      allocator,  // CPU 分配器
+      options.device());
 
-def logspace(
-    start: Number,
-    end: Number,
-    steps: int,
-    base: float = 10.0,
-    dtype=None,
-    layout=None,
-    device=None,
-    requires_grad=False,
-):
-    """
-    创建等比数列（对数间隔）
-    
-    Example::
-        >>> torch.logspace(0, 2, 5)
-        tensor([  1.,   3.162,  10.,  31.623, 100.])
-    """
-    return torch.ops.aten.logspace.default(start, end, steps, base, dtype, layout, device, requires_grad)
+  // 2. 创建 Tensor
+  return at::native::empty_strided(
+      size, stride, options.dtype(), options.device(), storage);
+}
 ```
 
-### 4.4 特殊矩阵类
+**特点**:
+- 不初始化内存内容 (包含随机数据)
+- 最快的分配方式
+- 适用于稍后填充数据的场景
+
+### 3.2 torch.zeros() / torch.ones()
 
 ```python
-def eye(n: int, m: int = None, dtype=None, layout=None, device=None, requires_grad=False):
-    """
-    创建单位矩阵
-    
-    Args:
-        n: 行数
-        m: 列数（默认为 n）
-    
-    Example::
-        >>> torch.eye(3)
-        tensor([[1., 0., 0.],
-                [0., 1., 0.],
-                [0., 0., 1.]])
-    """
-    if m is None:
-        m = n
-    return torch.ops.aten.eye.default(n, m, dtype, layout, device, requires_grad)
-
-
-def diag(diagonal: Tensor, diagonal_offset: int = 0):
-    """
-    创建对角矩阵或提取对角线
-    
-    Args:
-        diagonal: 对角线元素或输入 Tensor
-        diagonal_offset: 对角线偏移量
-    
-    Example::
-        >>> torch.diag(torch.tensor([1, 2, 3]))
-        tensor([[1, 0, 0],
-                [0, 2, 0],
-                [0, 0, 3]])
-    """
-    return torch.ops.aten.diag.default(diagonal, diagonal_offset)
-
-
-def triu(input: Tensor, diagonal: int = 0):
-    """
-    上三角矩阵
-    
-    Args:
-        input: 输入 Tensor
-        diagonal: 对角线偏移量
-    """
-    return torch.ops.aten.triu.default(input, diagonal)
-
-
-def tril(input: Tensor, diagonal: int = 0):
-    """
-    下三角矩阵
-    """
-    return torch.ops.aten.tril.default(input, diagonal)
+torch.zeros(size, *, dtype=None, device=None, ...) -> Tensor
+torch.ones(size, *, dtype=None, device=None, ...) -> Tensor
 ```
 
-### 4.5 *_like 系列函数
+**实现**:
+
+```cpp
+// zeros 实现
+Tensor zeros_symint(SymIntArrayRef size, const TensorOptions& options) {
+  // 先分配未初始化内存
+  Tensor tensor = at::empty_symint(size, options);
+  // 原地填充 0
+  tensor.zero_();
+  return tensor;
+}
+
+// ones 实现
+Tensor ones_symint(SymIntArrayRef size, const TensorOptions& options) {
+  Tensor tensor = at::empty_symint(size, options);
+  tensor.fill_(1);  // 原地填充 1
+  return tensor;
+}
+```
+
+**_like 变体**:
 
 ```python
-def zeros_like(
-    input: Tensor,
+torch.zeros_like(input, *, dtype=None, device=None, ...)
+torch.ones_like(input, *, dtype=None, device=None, ...)
+```
+
+从输入 Tensor 派生属性:
+
+```cpp
+Tensor zeros_like(const Tensor& self, const TensorOptions& options) {
+  return at::zeros(
+      self.sizes(),
+      options.dtype(optional_dtype(self.dtype(), options.dtype()))
+             .device(or_device(self.device(), options.device()))
+             .layout(self.layout())
+             .pinned_memory(options.pinned_memory()));
+}
+```
+
+### 3.3 torch.full()
+
+```python
+torch.full(
+    size,
+    fill_value,         # 填充值
+    *,
     dtype=None,
-    layout=None,
     device=None,
-    requires_grad=False,
-    memory_format=None,
-):
-    """
-    创建与输入 Tensor 形状相同的全 0 Tensor
-    
-    Args:
-        input: 参考 Tensor
-        dtype: 覆盖的数据类型
-        device: 覆盖的设备
-        memory_format: 内存格式
-    """
-    return torch.ops.aten.zeros_like.default(input, dtype, layout, device, requires_grad, memory_format)
+    ...
+) -> Tensor
+```
 
+**实现**:
 
-def ones_like(input: Tensor, dtype=None, layout=None, device=None, requires_grad=False):
-    """创建与输入 Tensor 形状相同的全 1 Tensor"""
-    return torch.ops.aten.ones_like.default(input, dtype, layout, device, requires_grad)
+```cpp
+Tensor full_symint(
+    SymIntArrayRef size,
+    const Scalar& fill_value,
+    const TensorOptions& options) {
 
-
-def empty_like(input: Tensor, dtype=None, layout=None, device=None, requires_grad=False):
-    """创建与输入 Tensor 形状相同的未初始化 Tensor"""
-    return torch.ops.aten.empty_like.default(input, dtype, layout, device, requires_grad)
-
-
-def full_like(input: Tensor, fill_value, dtype=None, layout=None, device=None, requires_grad=False):
-    """创建与输入 Tensor 形状相同并填充指定值的 Tensor"""
-    return torch.ops.aten.full_like.default(input, fill_value, dtype, layout, device, requires_grad)
+  Tensor tensor = at::empty_symint(size, options);
+  tensor.fill_(fill_value);
+  return tensor;
+}
 ```
 
 ---
 
-## 05. Tensor 构造函数
+## 4. 序列生成类工厂函数
 
-### 5.1 torch.tensor() vs torch.Tensor()
-
-```python
-# torch.tensor() - 推荐方式
-# 从数据创建新 Tensor，推断 dtype
-x = torch.tensor([1, 2, 3])           # dtype=torch.int64
-x = torch.tensor([1.0, 2.0, 3.0])     # dtype=torch.float32
-x = torch.tensor([1, 2], dtype=float) # 指定 dtype
-
-# torch.Tensor() - 旧式构造函数
-# 总是创建 float32，参数是形状
-y = torch.Tensor(3, 4)  # 3x4 的未初始化 float32 Tensor
-y = torch.Tensor([1, 2, 3])  # 从列表创建（不推荐）
-```
-
-### 5.2 torch.Tensor._make_subclass
-
-**源码位置**: `torch/_tensor.py`
+### 4.1 torch.arange()
 
 ```python
-class Tensor:
-    @staticmethod
-    def _make_subclass(cls, data, requires_grad=False):
-        """
-        创建 Tensor 子类的内部方法
-        
-        Args:
-            cls: 目标子类
-            data: 原始 Tensor 数据
-            requires_grad: 是否需要梯度
-        
-        Returns:
-            cls 类型的 Tensor
-        """
-        # 实际实现在 C++ 层
-        pass
-```
-
----
-
-## 06. 工厂函数的设备与类型推断
-
-### 6.1 默认设备与类型
-
-```python
-# 获取默认配置
-torch.get_default_dtype()      # torch.float32
-torch.get_default_device()     # device(type='cpu')
-
-# 设置默认配置
-torch.set_default_dtype(torch.float64)
-torch.set_default_device('cuda')  # 需要 CUDA 可用
-```
-
-### 6.2 类型推断规则
-
-```python
-# 工厂函数的类型推断优先级：
-# 1. 显式指定的 dtype
-# 2. 输入的 dtype（对于 *_like 函数）
-# 3. torch.get_default_dtype()
-
-# 示例
-torch.zeros(3, 4)                          # float32 (默认)
-torch.zeros(3, 4, dtype=torch.int32)       # int32 (指定)
-torch.zeros(3, 4, dtype=torch.complex64)   # complex64
-
-# 整数工厂函数有特殊规则
-torch.randint(0, 10, (3, 4))               # int64 (随机整数默认)
-torch.arange(5)                            # int64 (整数序列)
-```
-
-### 6.3 设备推断
-
-```python
-# 设备推断优先级：
-# 1. 显式指定的 device
-# 2. torch.get_default_device()
-# 3. 'cpu'
-
-# 示例
-torch.zeros(3, 4)                          # CPU
-torch.zeros(3, 4, device='cuda:0')         # CUDA:0
-torch.zeros(3, 4, device=torch.device('mps'))  # MPS
-
-# from 参数（某些函数）
-x = torch.randn(3, 4, device='cuda:0')
-torch.zeros_like(x)                        # 继承 x 的设备
-torch.zeros(3, 4, device=x.device)         # 显式继承
-```
-
----
-
-## 07. 内存格式控制
-
-### 7.1 memory_format 参数
-
-```python
-# 内存格式选项
-torch.contiguous_format      # 连续内存（默认）
-torch.preserve_format        # 保持输入格式
-torch.channels_last          # NHWC 格式（用于卷积）
-torch.channels_last_3d       # NDHWC 格式（用于 3D 卷积）
-
-# 使用示例
-x = torch.randn(3, 4, memory_format=torch.contiguous_format)
-
-# 保持格式
-y = torch.ones_like(x, memory_format=torch.preserve_format)
-
-# 通道优先转通道最后
-z = torch.randn(3, 224, 224, memory_format=torch.channels_last)
-```
-
-### 7.2 工厂函数的 memory_format
-
-```python
-def empty(
-    *size,
+torch.arange(
+    start=0,
+    end=None,
+    step=1,
+    *,
     dtype=None,
-    layout=None,
     device=None,
-    requires_grad=False,
-    pin_memory=False,
-    memory_format=torch.contiguous_format,  # 默认连续
-):
-    return torch.ops.aten.empty.memory_format(
-        size, dtype, layout, device, requires_grad, pin_memory, memory_format
-    )
+    requires_grad=False
+) -> Tensor
+```
+
+**C++ 实现**:
+
+```cpp
+// aten/src/ATen/native/TensorFactories.cpp
+Tensor arange_start_out(
+    const Scalar& start,
+    const Scalar& end,
+    const Scalar& step,
+    Tensor& out) {
+
+  // 1. 计算输出大小
+  int64_t size = ceil((end - start) / step);
+
+  // 2. 分配内存
+  out.resize_({size});
+
+  // 3. 填充等差数列
+  AT_DISPATCH_ALL_TYPES_AND2(
+      ScalarType::Half, ScalarType::BFloat16,
+      out.scalar_type(), "arange", [&] {
+        auto* out_data = out.data_ptr<scalar_t>();
+        scalar_t val = start.to<scalar_t>();
+        scalar_t step_val = step.to<scalar_t>();
+
+        for (int64_t i = 0; i < size; i++) {
+          out_data[i] = val;
+          val += step_val;
+        }
+      });
+
+  return out;
+}
+```
+
+**示例**:
+
+```python
+torch.arange(5)           # tensor([0, 1, 2, 3, 4])
+torch.arange(2, 8)        # tensor([2, 3, 4, 5, 6, 7])
+torch.arange(0, 10, 2)    # tensor([0, 2, 4, 6, 8])
+torch.arange(0.5, 2, 0.5) # tensor([0.5, 1.0, 1.5])
+```
+
+### 4.2 torch.linspace()
+
+```python
+torch.linspace(
+    start,
+    end,
+    steps=100,
+    *,
+    dtype=None,
+    device=None
+) -> Tensor
+```
+
+**实现**:
+
+```cpp
+Tensor linspace(
+    const Scalar& start,
+    const Scalar& end,
+    int64_t steps,
+    const TensorOptions& options) {
+
+  Tensor result = at::empty({steps}, options);
+
+  if (steps > 0) {
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        ScalarType::Double, ScalarType::BFloat16,
+        result.scalar_type(), "linspace", [&] {
+          scalar_t start_val = start.to<scalar_t>();
+          scalar_t end_val = end.to<scalar_t>();
+          scalar_t step = (end_val - start_val) / (steps - 1);
+
+          for (int64_t i = 0; i < steps; i++) {
+            result.data_ptr<scalar_t>()[i] = start_val + i * step;
+          }
+        });
+  }
+
+  return result;
+}
+```
+
+**示例**:
+
+```python
+torch.linspace(0, 1, steps=5)
+# tensor([0.0000, 0.2500, 0.5000, 0.7500, 1.0000])
 ```
 
 ---
 
-## 附录：完整工厂函数清单
+## 5. Tensor.new_*() 方法族
 
-### 基础工厂函数
+### 5.1 概述
 
-| 函数 | 说明 |
+`new_*` 方法基于调用 Tensor 的 dtype 和 device 创建新 Tensor：
+
+```python
+x = torch.randn(3, 4, dtype=torch.float64, device='cuda:0')
+
+# 基于 x 的属性创建新 Tensor
+y = x.new_ones(2, 3)       # dtype=torch.float64, device='cuda:0'
+z = x.new_zeros(4, 5)      # dtype=torch.float64, device='cuda:0'
+w = x.new_empty((6, 7))    # dtype=torch.float64, device='cuda:0'
+
+# 可以覆盖默认属性
+a = x.new_ones(2, 3, dtype=torch.float32)  # dtype=torch.float32, device='cuda:0'
+```
+
+### 5.2 C++ 绑定
+
+**源码**: `torch/csrc/Module.cpp`
+
+```cpp
+// Tensor 类的方法绑定
+m.def(TensorType, "new_empty", &new_empty);
+m.def(TensorType, "new_ones", &new_ones);
+m.def(TensorType, "new_zeros", &new_zeros);
+m.def(TensorType, "new_full", &new_full);
+m.def(TensorType, "new_tensor", &new_tensor);
+```
+
+### 5.3 实现
+
+```cpp
+// Tensor.new_*() 的通用实现模式
+Tensor Tensor_new_ones(
+    const Tensor& self,
+    IntArrayRef size,
+    const TensorOptions& options) {
+
+  // 从 self 派生 options
+  auto derived_options = self.options()
+      .dtype(options.dtype().value_or(self.dtype()))
+      .device(options.device().value_or(self.device()))
+      .layout(self.layout())
+      .pinned_memory(options.pinned_memory());
+
+  return at::ones(size, derived_options);
+}
+```
+
+---
+
+## 6. 特殊格式工厂函数
+
+### 6.1 torch.eye()
+
+```python
+torch.eye(
+    n,              # 行数
+    m=None,         # 列数 (默认等于 n)
+    *,
+    dtype=None,
+    device=None
+) -> Tensor
+```
+
+**实现**:
+
+```cpp
+Tensor eye(
+    int64_t n,
+    c10::optional<int64_t> m,
+    const TensorOptions& options) {
+
+  int64_t rows = n;
+  int64_t cols = m.value_or(n);
+
+  Tensor result = at::zeros({rows, cols}, options);
+
+  // 填充对角线
+  AT_DISPATCH_ALL_TYPES_AND2(
+      ScalarType::Half, ScalarType::BFloat16,
+      result.scalar_type(), "eye", [&] {
+        int64_t diagonal_size = std::min(rows, cols);
+        scalar_t* result_data = result.data_ptr<scalar_t>();
+        int64_t stride = result.stride(0) + result.stride(1) + 1;
+
+        for (int64_t i = 0; i < diagonal_size; i++) {
+          result_data[i * stride] = scalar_t(1);
+        }
+      });
+
+  return result;
+}
+```
+
+### 6.2 torch.diag()
+
+```python
+# 从对角线创建矩阵
+torch.diag(diagonal, diagonal_index=0) -> Tensor
+
+# 从矩阵提取对角线
+torch.diag(input, diagonal_index=0) -> Tensor
+```
+
+**实现**:
+
+```cpp
+Tensor diagflat(const Tensor& diagonal, int64_t diagonal_index) {
+  // 计算矩阵大小
+  int64_t n = diagonal.size(0) + std::abs(diagonal_index);
+
+  Tensor result = at::zeros({n, n}, diagonal.options());
+
+  // 填充对角线
+  result.diagonal(diagonal_index).copy_(diagonal);
+
+  return result;
+}
+```
+
+---
+
+## 7. 工厂函数的 DispatchKey 处理
+
+### 7.1 DispatchKey 排除
+
+工厂函数需要排除某些 DispatchKey 以确保正确的行为：
+
+```cpp
+Tensor empty_with_dispatch(
+    IntArrayRef size,
+    const TensorOptions& options) {
+
+  // 排除以下 DispatchKey
+  at::AutoDispatchBelowADInplaceOrView guard;  // 排除 Autograd
+  c10::impl::ExcludeDispatchKeyGuard python_guard(
+      c10::DispatchKey::Python);  // 排除 Python
+  c10::impl::ExcludeDispatchKeyGuard fake_guard(
+      c10::DispatchKey::Fake);    // 排除 Fake
+
+  // 实际分配
+  return at::native::empty_strided(
+      size,
+      compute_strides(size, MemoryFormat::Contiguous),
+      options.dtype(),
+      options.device());
+}
+```
+
+### 7.2 lift_fresh()
+
+```cpp
+// 将 Tensor 提升到当前上下文
+Tensor lift_fresh(const Tensor& tensor) {
+  // 处理 functorch 包装
+  // 处理 functionalization
+  // 处理 FakeTensor
+  return at::lift_fresh_copy(tensor);
+}
+```
+
+---
+
+## 8. 关键源码索引
+
+| 文件 | 行号 | 内容 |
+|------|------|------|
+| `torch/csrc/utils/tensor_new.cpp` | L265-L489 | internal_new_from_data() |
+| `torch/csrc/utils/tensor_new.cpp` | L203-L263 | recursive_store() |
+| `torch/csrc/utils/tensor_new.cpp` | L123-L200 | infer_scalar_type() |
+| `aten/src/ATen/native/TensorFactories.cpp` | - | empty/zeros/ones 实现 |
+| `aten/src/ATen/native/TensorFactories.cpp` | - | arange/linspace 实现 |
+
+---
+
+## 9. 下一步
+
+| 章节 | 主题 |
 |------|------|
-| `zeros()` | 全 0 |
-| `ones()` | 全 1 |
-| `empty()` | 未初始化 |
-| `full()` | 填充指定值 |
-| `zeros_like()` | 同形状全 0 |
-| `ones_like()` | 同形状全 1 |
-| `empty_like()` | 同形状未初始化 |
-| `full_like()` | 同形状填充 |
-
-### 随机数生成
-
-| 函数 | 说明 |
-|------|------|
-| `rand()` | 均匀分布 [0,1) |
-| `randn()` | 标准正态分布 |
-| `randint()` | 随机整数 |
-| `randperm()` | 随机排列 |
-| `bernoulli()` | 伯努利分布 |
-| `multinomial()` | 多项式分布 |
-| `normal()` | 正态分布 |
-| `uniform()` | 均匀分布 |
-
-### 序列生成
-
-| 函数 | 说明 |
-|------|------|
-| `arange()` | 等差数列 |
-| `linspace()` | 等间距数列 |
-| `logspace()` | 对数间隔数列 |
-| `geometric()` | 几何分布 |
-
-### 特殊矩阵
-
-| 函数 | 说明 |
-|------|------|
-| `eye()` | 单位矩阵 |
-| `diag()` | 对角矩阵 |
-| `diag_embed()` | 对角嵌入 |
-| `triangular()` | 三角矩阵 |
-| `triu()` | 上三角 |
-| `tril()` | 下三角 |
-| `bmm()` | 批量矩阵乘法 |
+| [Part 6](./06-dispatcher.md) | 分发机制 |
 
 ---
 
-## 后续章节
-
-- [06. Dispatcher 调度系统](./06-dispatcher.md) - Dispatch Key 机制
+**参考资料**:
+- `torch/csrc/utils/tensor_new.cpp` - Tensor 创建核心实现
+- `aten/src/ATen/native/TensorFactories.cpp` - ATen 工厂函数

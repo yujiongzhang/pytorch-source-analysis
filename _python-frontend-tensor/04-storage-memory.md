@@ -1,702 +1,617 @@
-# 04. Storage 与内存管理
+# Python 层 Tensor API（四）：存储与内存管理
 
-> 本文档深入解析 PyTorch 的底层存储系统与内存管理机制
+> **前序**: [Part 3 - 自动微分集成](./03-autograd.md)
+> **核心源码**: `torch/csrc/Storage.cpp`, `c10/core/Storage.h`, `c10/core/StorageImpl.h`
 
 ---
 
-## 01. Storage 存储系统详解
+## 1. Storage 架构概览
 
 ### 1.1 Storage 层次结构
 
-PyTorch 的存储系统分为两层：
-
 ```
-Tensor (逻辑视图)
-  │
-  ├─ storage_offset: 在 Storage 中的起始位置
-  ├─ size: 逻辑形状 [3, 4]
-  └─ stride: 逻辑步幅 (4, 1)
-        │
-        ↓
-TypedStorage (类型化存储，已弃用)
-  │
-  └─ _untyped_storage
-        │
-        ↓
-UntypedStorage (无类型存储，底层字节数组)
-```
-
-### 1.2 _StorageBase 基类
-
-**源码位置**: `torch/storage.py:41-200`
-
-```python
-class _StorageBase:
-    """所有 Storage 类的抽象基类"""
-    
-    _cdata: Any  # C++ 存储对象的指针
-    is_sparse: bool = False
-    is_sparse_csr: bool = False
-    device: torch.device
-    _fake_device: torch.device | None = None  # FakeTensor 用
-    _checkpoint_offset: int | None = None  # 序列化用
-    
-    def __len__(self) -> int:
-        """返回存储的元素数量"""
-        raise NotImplementedError
-    
-    def __getitem__(self, idx):
-        """通过索引访问元素"""
-        raise NotImplementedError
-    
-    def __setitem__(self, *args, **kwargs):
-        """通过索引设置元素"""
-        raise NotImplementedError
-    
-    def copy_(self, source, non_blocking=False):
-        """从另一个存储复制数据"""
-        raise NotImplementedError
-    
-    def nbytes(self) -> int:
-        """返回存储占用的字节数"""
-        raise NotImplementedError
-    
-    def size(self) -> int:
-        """返回存储大小（字节数）"""
-        return self.nbytes()
-    
-    def element_size(self) -> int:
-        """返回每个元素的字节数"""
-        raise NotImplementedError
-    
-    def data_ptr(self) -> int:
-        """返回底层数据指针（内存地址）"""
-        raise NotImplementedError
-    
-    def resizable(self) -> bool:
-        """返回存储是否可调整大小"""
-        raise NotImplementedError
-    
-    def resize_(self, size: int):
-        """原地调整存储大小"""
-        raise NotImplementedError
+┌─────────────────────────────────────────────────────────┐
+│              Python Storage (THPStorage)                 │
+│           (torch.FloatStorage, etc.)                     │
+└─────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────┐
+│              C++ Storage (c10::Storage)                  │
+│              持有 StorageImpl 指针                        │
+└─────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────┐
+│              StorageImpl (c10::StorageImpl)              │
+│  - DataPtr (数据指针)                                    │
+│  - Allocator (分配器)                                    │
+│  - nbytes (内存大小)                                     │
+│  - resizable (是否可调整大小)                            │
+└─────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────┐
+│              DataPtr + 实际内存                          │
+│              (CPU/CUDA/MPS Memory)                       │
+└─────────────────────────────────────────────────────────┘
 ```
 
-### 1.3 TypedStorage 类
+### 1.2 设计与 Tensor 的关系
 
-**源码位置**: `torch/storage.py`
-
-```python
-class TypedStorage:
-    """
-    带类型信息的 Storage（已弃用，但为了向后兼容仍在使用）
-    
-    .. warning::
-        TypedStorage is deprecated. It will be removed in the future, and
-        UntypedStorage will be the only storage class.
-    """
-    
-    def __init__(self, wrap_storage, dtype, _internal=False):
-        """
-        Args:
-            wrap_storage: 底层 UntypedStorage
-            dtype: 数据类型
-            _internal: 内部使用标志（避免弃用警告）
-        """
-        self._untyped_storage = wrap_storage
-        self.dtype = dtype
-    
-    def __repr__(self):
-        info_str = f"[{torch.typename(self)}(device={self.device}) of size {len(self)}]"
-        if self.device.type == "meta":
-            return "...\n" + info_str
-        data_str = " " + "\n ".join(str(self[i]) for i in range(self.size()))
-        return data_str + "\n" + info_str
-    
-    def __copy__(self):
-        return self.clone()
-    
-    def __deepcopy__(self, memo):
-        memo = memo.setdefault("torch", {})
-        if self._cdata in memo:
-            return memo[self._cdata]
-        new_storage = self.clone()
-        memo[self._cdata] = new_storage
-        return new_storage
-    
-    def clone(self):
-        """返回此存储的副本"""
-        return type(self)(self.nbytes(), device=self.device).copy_(self)
-    
-    def _share_memory_(self):
-        """将存储移到共享内存"""
-        with _share_memory_lock:
-            # ... 共享内存实现
-            pass
+```
+Tensor (at::Tensor)
+    ↓ (指向)
+TensorImpl
+    ↓ (指向)
+Storage
+    ↓ (指向)
+StorageImpl
+    ↓ (指向)
+DataPtr → 实际数据内存
 ```
 
-### 1.4 UntypedStorage 类
-
-**源码位置**: `torch/storage.py`
-
-```python
-class UntypedStorage:
-    """
-    无类型底层存储 - 原始字节数组
-    
-    这是未来唯一的 Storage 类型
-    """
-    
-    def __new__(cls, size_or_sequence=None, device=None, dtype=None):
-        """
-        创建 UntypedStorage
-        
-        Args:
-            size_or_sequence: 大小或序列
-            device: 设备类型
-            dtype: (可选) 用于推断元素大小的数据类型
-        """
-        # 实际实现在 C++ 层
-        pass
-    
-    @classmethod
-    def from_file(cls, filename, shared=False, nbytes=None):
-        """从文件创建存储"""
-        pass
-    
-    @classmethod
-    def from_buffer(cls, buffer):
-        """从缓冲区（如 numpy 数组）创建存储"""
-        pass
-```
-
-### 1.5 Storage 类型转换
-
-**源码位置**: `torch/storage.py:273-353`
-
-```python
-class _StorageBase:
-    def _to(self, dtype):
-        """
-        转换为指定 dtype 的 TypedStorage
-        
-        注意：如果 dtype 与当前类型相同，仍会创建副本
-        """
-        if not isinstance(dtype, torch.dtype):
-            raise TypeError(f"Argument 'dtype' must be torch.dtype")
-        
-        # 创建 Tensor 视图，转换类型，再提取 Storage
-        storage = (
-            torch.tensor([], dtype=torch.uint8, device=self.device)
-            .set_(cast(Storage, self))
-            .to(dtype)
-            ._typed_storage()
-        )
-        
-        # 如果数据指针相同，需要克隆（避免共享）
-        if storage.data_ptr() == self.data_ptr():
-            storage = storage.clone()
-        return storage
-    
-    # 便捷类型转换方法
-    def double(self): return self._to(torch.double)
-    def float(self): return self._to(torch.float)
-    def half(self): return self._to(torch.half)
-    def long(self): return self._to(torch.long)
-    def int(self): return self._to(torch.int)
-    def short(self): return self._to(torch.short)
-    def char(self): return self._to(torch.int8)
-    def byte(self): return self._to(torch.uint8)
-    def bool(self): return self._to(torch.bool)
-    def bfloat16(self): return self._to(torch.bfloat16)
-    def complex_double(self): return self._to(torch.cdouble)
-    def complex_float(self): return self._to(torch.cfloat)
-```
+**关键区别**:
+- **Tensor**: 多维数组视图，包含 sizes/strides
+- **Storage**: 一维连续内存块，不关心形状
 
 ---
 
-## 02. Tensor 与 Storage 的关系
+## 2. Python Storage 类
 
-### 2.1 Tensor 使用 Storage
+### 2.1 Storage 类型
 
-**源码位置**: `torch/_tensor.py:298-321`
+PyTorch 为每种数据类型提供对应的 Storage 类型：
 
 ```python
-class Tensor:
-    def storage(self):
-        r"""
-        返回底层 TypedStorage（已弃用）
-        
-        .. warning::
-            TypedStorage is deprecated.
-        """
-        if has_torch_function_unary(self):
-            return handle_torch_function(Tensor.storage, (self,), self)
-        torch.storage._warn_typed_storage_removal(stacklevel=2)
-        return self._typed_storage()
-    
-    def _typed_storage(self):
-        """内部方法，获取 TypedStorage"""
-        untyped_storage = self.untyped_storage()
-        return torch.TypedStorage(
-            wrap_storage=untyped_storage, 
-            dtype=self.dtype, 
-            _internal=True
-        )
-    
-    def untyped_storage(self):
-        """
-        返回底层 UntypedStorage（推荐方式）
-        
-        Example::
-            >>> x = torch.randn(3, 4)
-            >>> storage = x.untyped_storage()
-            >>> len(storage)  # 元素数量
-            12
-            >>> storage.nbytes()  # 字节数
-            48  # 12 * 4 (float32)
-        """
-        # C++ 实现
-        pass
+# CPU Storage
+torch.Storage              # 默认 (FloatStorage)
+torch.FloatStorage         # float32
+torch.DoubleStorage        # float64
+torch.IntStorage           # int32
+torch.LongStorage          # int64
+torch.ShortStorage         # int16
+torch.ByteStorage          # uint8
+torch.BoolTensor           # bool
+torch.HalfStorage          # float16
+torch.BFloat16Storage      # bfloat16
+torch.ComplexFloatStorage  # complex64
+torch.ComplexDoubleStorage # complex128
+
+# CUDA Storage
+torch.cuda.Storage         # 默认
+torch.cuda.FloatStorage
+torch.cuda.DoubleStorage
+# ... 其他 CUDA 类型
 ```
 
-### 2.2 共享 Storage 的 Tensor 视图
+### 2.2 Storage 构造
+
+**源码**: `torch/csrc/Storage.cpp` (L105-L250)
+
+```cpp
+static PyObject* THPStorage_pynew(
+    PyTypeObject* type,
+    PyObject* args,
+    PyObject* kwargs) {
+
+  // 参数解析
+  static torch::PythonArgParser parser({
+      "Storage(*, allocator=None, device=None)",
+      "Storage(int64_t size, *, allocator=None, device=None)",
+      "Storage(PyObject* sequence, *, allocator=None, device=None)",
+  });
+
+  auto r = parser.parse(args, kwargs, parsed_args);
+
+  // 获取分配器
+  c10::Allocator* allocator = nullptr;
+  if (device_opt.has_value()) {
+    switch (device.type()) {
+      case at::kCPU:
+        allocator = c10::GetDefaultCPUAllocator();
+        break;
+#ifdef USE_CUDA
+      case at::kCUDA:
+        allocator = c10::cuda::CUDACachingAllocator::get();
+        break;
+#endif
+#ifdef USE_MPS
+      case at::kMPS:
+        allocator = at::mps::GetMPSAllocator();
+        break;
+#endif
+      // ... 其他设备
+    }
+  }
+
+  // 创建 Storage
+  if (r.idx == 0) {
+    // 空 Storage
+    self = THPStorage_NewWithStorage(
+        type,
+        make_storage_impl(
+            c10::StorageImpl::use_byte_size_t(),
+            0,
+            at::DataPtr(),
+            allocator,
+            /*resizable=*/true,
+            device_opt));
+
+  } else if (r.idx == 1) {
+    // 指定大小的 Storage
+    auto size = r.toInt64(0);
+    self = THPStorage_NewWithStorage(
+        type,
+        make_storage_impl(
+            c10::StorageImpl::use_byte_size_t(),
+            size * element_size(dtype),
+            allocator,
+            device_opt));
+
+  } else if (r.idx == 2) {
+    // 从序列创建
+    auto data = r.pyobject(0);
+    // ... 数据转换逻辑
+  }
+
+  return self;
+}
+```
+
+### 2.3 Python 使用示例
 
 ```python
 import torch
 
-# 创建 Tensor
-x = torch.tensor([1.0, 2.0, 3.0, 4.0])
+# 创建空 Storage
+storage = torch.FloatStorage(100)  # 100 个 float32 元素
 
-# 创建视图（共享存储）
-y = x[1:3]
-
-# 验证共享存储
-print(x.storage().data_ptr() == y.storage().data_ptr())  # True
-
-# 修改视图会影响原 Tensor
-y[0] = 100.0
-print(x)  # tensor([1., 100., 3., 4.])
-
-# storage_offset 表示视图在存储中的起始位置
-print(y.storage_offset())  # 1
-```
-
-### 2.3 set_ 方法 - 直接设置 Storage
-
-**源码位置**: C++ 实现
-
-```python
-x = torch.Tensor()
-
-# 直接使用 Storage 设置 Tensor
+# 从序列创建
 storage = torch.FloatStorage([1.0, 2.0, 3.0, 4.0])
-x.set_(storage, 0, (2, 2), (2, 1))
 
-print(x)
-# tensor([[1., 2.],
-#         [3., 4.]])
+# 指定设备
+storage_cpu = torch.FloatStorage(100, device='cpu')
+storage_cuda = torch.cuda.FloatStorage(100)  # 需要 CUDA
 
-# set_ 参数说明:
-# set_(storage, storage_offset, size, stride)
+# 从 Buffer 创建
+import io
+buffer = io.BytesIO()
+storage.save(buffer)
+buffer.seek(0)
+restored = torch.FloatStorage.from_buffer(buffer)
 ```
 
 ---
 
-## 03. 跨进程共享内存
+## 3. StorageImpl 核心结构
 
-### 3.1 share_memory_() 方法
+### 3.1 StorageImpl 定义
 
-**源码位置**: `torch/storage.py:391-400` 和 `torch/_tensor.py:844-855`
+**源码**: `c10/core/StorageImpl.h`
 
-```python
-class _StorageBase:
-    def share_memory_(self):
-        """
-        将存储移到共享内存
-        
-        对于 CUDA 或 PrivateUse1 设备，这是无操作（因为它们使用 IPC）
-        对于 CPU，使用文件系统或 POSIX 共享内存
-        """
-        from torch.multiprocessing import get_sharing_strategy
-        
-        if self.device.type in ["cuda", torch._C._get_privateuse1_backend_name()]:
-            pass  # CUDA 使用 IPC，不需要特殊处理
-        elif get_sharing_strategy() == "file_system":
-            self._share_filename_cpu_()  # 使用文件描述符共享
-        else:
-            self._share_fd_cpu_()  # 使用文件名共享
-        
-        return self
+```cpp
+struct C10_API StorageImpl : public intrusive_ptr_target {
+  // 构造函数
+  StorageImpl(
+      caffe2::TypeMeta dtype,
+      const SymInt& size_bytes,
+      at::DataPtr data_ptr,
+      Allocator* allocator,
+      bool resizable = false);
 
+  // 数据访问
+  void* mutable_data() const;
+  const void* data() const;
+  at::DataPtr& mutable_data_ptr() const;
+  const at::DataPtr& data_ptr() const;
 
-class Tensor:
-    def share_memory_(self):
-        """
-        将 Tensor 的底层存储移到共享内存
-        
-        Returns:
-            self (用于链式调用)
-        """
-        if has_torch_function_unary(self):
-            return handle_torch_function(Tensor.share_memory_, (self,), self)
-        self._typed_storage()._share_memory_()
-        return self
+  // 设置数据指针
+  at::DataPtr set_data_ptr(at::DataPtr&& data_ptr) const;
+
+  // 大小
+  size_t nbytes() const { return nbytes_; }
+  SymInt sym_nbytes() const { return sym_nbytes_; }
+
+  // 分配器
+  Allocator* allocator() const { return allocator_; }
+
+  // 是否可调整大小
+  bool resizable() const { return resizable_; }
+
+  // 设备
+  Device device() const { return data_ptr_.device(); }
+
+  // 删除器
+  void set_deleter(std::function<void(void*)> deleter) {
+    deleter_ = std::move(deleter);
+  }
+
+ protected:
+  at::DataPtr data_ptr_;           // 数据指针
+  size_t nbytes_;                  // 内存大小 (字节)
+  SymInt sym_nbytes_;              // 符号内存大小
+  Allocator* allocator_;           // 内存分配器
+  bool resizable_;                 // 是否可调整大小
+  std::function<void(void*)> deleter_;  // 自定义删除器
+};
 ```
 
-### 3.2 is_shared() 检查
+### 3.2 DataPtr 智能指针
 
-```python
-class Tensor:
-    def is_shared(self):
-        r"""
-        检查 Tensor 是否在共享内存中
-        
-        CUDA Tensor 总是返回 True
-        
-        Returns:
-            bool
-        """
-        if has_torch_function_unary(self):
-            return handle_torch_function(Tensor.is_shared, (self,), self)
-        return self._typed_storage()._is_shared()
+**源码**: `c10/core/MemoryFormat.h` / `c10/core/impl/DataPtrImpl.h`
+
+```cpp
+struct DataPtr {
+  // 构造
+  DataPtr() : ptr_(nullptr), deleter_(nullptr), device_(kCPU), allocator_(nullptr) {}
+
+  DataPtr(
+      void* ptr,
+      int64_t device_index,
+      DeviceType device_type,
+      std::function<void(void*)> deleter,
+      Allocator* allocator = nullptr)
+      : ptr_(ptr),
+        deleter_(std::move(deleter)),
+        device_(device_type, device_index),
+        allocator_(allocator) {}
+
+  // 析构 - 自动释放内存
+  ~DataPtr() {
+    if (ptr_ && deleter_) {
+      deleter_(ptr_);
+    }
+  }
+
+  // 访问器
+  void* get() const { return ptr_; }
+  Device device() const { return device_; }
+  Allocator* allocator() const { return allocator_; }
+
+ private:
+  void* ptr_;                              // 原始指针
+  std::function<void(void*)> deleter_;     // 删除函数
+  Device device_;                          // 设备信息
+  Allocator* allocator_;                   // 分配器
+};
 ```
 
-### 3.3 多进程使用示例
+---
+
+## 4. 内存分配器
+
+### 4.1 CPU 分配器
+
+**源码**: `c10/core/CPUAllocator.cpp`
+
+```cpp
+// 默认 CPU 分配器
+class DefaultCPUAllocator : public Allocator {
+ public:
+  DefaultCPUAllocator() = default;
+
+  DataPtr allocate(size_t n) override {
+    if (n == 0) return DataPtr(nullptr, 0, kCPU, nullptr, this);
+
+    void* ptr = aligned_alloc(kAlignment, n);
+    if (!ptr) {
+      throw std::bad_alloc();
+    }
+
+    return DataPtr(
+        ptr,
+        0,  // device_index
+        kCPU,
+        [](void* ptr) { ::free(ptr); },  // deleter
+        this);
+  }
+
+  void* raw_alloc(size_t nbytes) override {
+    return aligned_alloc(kAlignment, nbytes);
+  }
+
+  void raw_dealloc(void* ptr) override {
+    ::free(ptr);
+  }
+
+ private:
+  static constexpr size_t kAlignment = 64;  // 缓存行对齐
+};
+```
+
+### 4.2 CUDA 分配器
+
+**源码**: `c10/cuda/CUDACachingAllocator.h`
+
+```cpp
+// CUDA 缓存分配器
+class CUDACachingAllocator : public Allocator {
+ public:
+  // 获取单例
+  static Allocator* get();
+
+  DataPtr allocate(size_t n) override {
+    if (n == 0) return DataPtr(nullptr, 0, kCUDA, nullptr, this);
+
+    void* ptr = allocateMemory(n, nullptr);
+
+    return DataPtr(
+        ptr,
+        CUDADeviceGuard::current_device(),
+        kCUDA,
+        [](void* ptr) { delete ptr; },  // 实际由缓存池管理
+        this);
+  }
+
+  // 缓存统计
+  struct Stats {
+    size_t allocated_bytes;
+    size_t freed_bytes;
+    size_t reserved_bytes;
+    size_t allocated_bytes_peak;
+    size_t freed_bytes_peak;
+    size_t reserved_bytes_peak;
+  };
+
+  static Stats getDeviceStats(int device);
+  static void resetAccumulatedMemoryStats(int device);
+};
+```
+
+**CUDA 缓存分配器特点**:
+- 缓存已释放的 GPU 内存，避免频繁 cudaMalloc/cudaFree
+- 支持内存池，减少碎片
+- 提供统计信息用于调试和优化
+
+### 4.3 MPS 分配器 (Metal)
+
+**源码**: `aten/src/ATen/mps/MPSAllocator.mm`
+
+```cpp
+// MPS (Metal Performance Shaders) 分配器
+class MPSAllocator : public Allocator {
+ public:
+  DataPtr allocate(size_t n) override {
+    // 使用 Metal 的 shared 内存
+    auto device = at::mps::getMPSDevice();
+    void* ptr = device->allocate(n);
+
+    return DataPtr(
+        ptr,
+        0,  // MPS 只有一个设备
+        kMPS,
+        [device](void* ptr) { device->dealloc(ptr); },
+        this);
+  }
+};
+```
+
+---
+
+## 5. 内存共享
+
+### 5.1 share_memory_()
+
+**源码**: `torch/csrc/StorageSharing.cpp`
+
+```python
+# Python API
+storage = torch.FloatStorage(100)
+storage.share_memory_()  # 移动到共享内存
+
+# 多进程使用
+import torch.multiprocessing as mp
+
+def worker(storage):
+    storage[0] = 42.0
+
+if __name__ == '__main__':
+    storage = torch.FloatStorage(100)
+    storage.share_memory_()
+
+    p = mp.Process(target=worker, args=(storage,))
+    p.start()
+    p.join()
+
+    print(storage[0])  # 42.0
+```
+
+**C++ 实现**:
+
+```cpp
+static PyObject* THPStorage_shareMemory_(PyObject* self, PyObject* args) {
+  HANDLE_TH_ERRORS
+
+  auto storage = THPStorage_Unpack(self);
+
+  // 创建共享内存
+  #if defined(_WIN32)
+    // Windows: 使用 CreateFileMapping
+    HANDLE handle = CreateFileMapping(...);
+  #else
+    // Unix: 使用 shm_open
+    int fd = shm_open(...);
+  #endif
+
+  // 设置共享内存
+  storage.share_memory_();
+
+  Py_RETURN_NONE;
+  END_HANDLE_TH_ERRORS
+}
+```
+
+### 5.2 多进程 Storage
+
+**源码**: `torch/multiprocessing/reductions.py`
 
 ```python
 import torch
 import torch.multiprocessing as mp
+from torch.multiprocessing.reductions import StorageWeakRef
 
-def worker(tensor):
-    # 修改共享 Tensor
-    tensor.add_(1)
-    print(f"Worker: {tensor}")
+# Tensor 序列化与反序列化
+def reduce_tensor(tensor):
+    storage = tensor.storage()
+    return (
+        storage._reduce_ex_internal(None),
+        tensor.storage_offset(),
+        tensor.size(),
+        tensor.stride(),
+    )
 
-if __name__ == "__main__":
-    # 创建 Tensor 并移到共享内存
-    x = torch.tensor([1.0, 2.0, 3.0])
-    x.share_memory_()
-    
-    # 启动进程
-    p = mp.Process(target=worker, args=(x,))
-    p.start()
-    p.join()
-    
-    # 主进程能看到修改
-    print(f"Main: {x}")  # tensor([2., 3., 4.])
+def rebuild_tensor(storage_data, offset, size, stride):
+    storage = torch.storage.TypedStorage._rebuild(storage_data)
+    return storage.as_tensor(offset, size, stride)
+
+# 注册 pickle 序列化器
+import copyreg
+copyreg.pickle(torch.Tensor, reduce_tensor, rebuild_tensor)
 ```
 
 ---
 
-## 04. 内存分配器
+## 6. 内存管理最佳实践
 
-### 4.1 CPU 内存分配
-
-CPU 内存使用标准分配器：
+### 6.1 避免内存泄漏
 
 ```python
-# 创建 Tensor 时分配内存
-x = torch.randn(1000, 1000)  # 分配 ~8MB
+# 不好：累积梯度
+for _ in range(100):
+    loss = compute_loss()
+    loss.backward()  # 梯度累积
+    # 忘记清零梯度
 
-# 查看内存使用
-import sys
-print(f"Tensor size: {x.element_size() * x.numel()} bytes")  # 8000000 bytes
-
-# 手动释放内存
-del x
-import gc
-gc.collect()
+# 好：及时清零
+for _ in range(100):
+    optimizer.zero_grad()  # 清零梯度
+    loss = compute_loss()
+    loss.backward()
+    optimizer.step()
 ```
 
-### 4.2 CUDA 内存分配
-
-**源码位置**: `torch/cuda/memory.py`
+### 6.2 使用 no_grad 减少内存
 
 ```python
-def summary(memory_type=None):
-    """
-    返回 CUDA 内存使用摘要
-    
-    Returns:
-        dict: 包含已分配/缓存内存的统计信息
-    """
-    pass
+# 训练时需要梯度
+model.train()
+for batch in dataloader:
+    output = model(batch)
+    loss = criterion(output, target)
+    loss.backward()
 
-def memory_allocated(device=None):
-    """
-    返回当前为张量分配的 GPU 内存（字节）
-    """
-    pass
-
-def max_memory_allocated(device=None):
-    """
-    返回历史上为张量分配的最大 GPU 内存（字节）
-    """
-    pass
-
-def memory_reserved(device=None):
-    """
-    返回当前缓存中保留的 GPU 内存（字节）
-    """
-    pass
-
-def memory_stats(device=None):
-    """
-    返回详细的内存统计信息字典
-    """
-    pass
+# 推理时禁用梯度
+model.eval()
+with torch.no_grad():
+    for batch in dataloader:
+        output = model(batch)
+        # 不追踪梯度，节省内存
 ```
 
-### 4.3 CUDA 内存管理函数
+### 6.3 CUDA 内存管理
 
 ```python
-def empty_cache():
-    """
-    释放所有未使用的缓存内存
-    
-    注意：这不会释放正在使用的内存，只会释放缓存池中的空闲内存
-    """
-    torch._C._cuda_emptyCache()
+# 查看 CUDA 内存统计
+print(torch.cuda.memory_stats())
 
-def reset_peak_memory_stats(device=None):
-    """
-    重置峰值内存统计
-    """
-    pass
+# 查看已分配内存
+print(torch.cuda.memory_allocated())
 
-def _record_memory_history(
-    enabled=True,
-    device=None,
-    record_shapes=True,
-    record_memory_allocations=True,
-    stack_traces_mode=None,
-):
-    """
-    记录内存历史用于分析
-    
-    可与 torch.cuda._convert_memory_history 配合使用生成报告
-    """
-    pass
+# 查看缓存内存
+print(torch.cuda.memory_reserved())
+
+# 清空缓存
+torch.cuda.empty_cache()
+
+# 使用缓存分配器统计
+print(torch.cuda.memory_summary())
 ```
 
-### 4.4 Pinned Memory（锁定内存）
+### 6.4 使用 pin_memory 加速 CPU-GPU 传输
 
 ```python
-class _StorageBase:
-    def pin_memory(self, device="cuda"):
-        r"""
-        将 CPU 存储复制到锁定（pinned）内存
-        
-        锁定内存可以与 GPU 进行异步数据传输
-        
-        Returns:
-            锁定内存中的存储副本
-        """
-        if self.device.type != "cpu":
-            raise TypeError(f"cannot pin '{self.type()}' only CPU memory can be pinned")
-        
-        pinned_tensor = (
-            torch.tensor([], dtype=torch.uint8, device=self.device)
-            .set_(cast(Storage, self))
-            .pin_memory(device)
-        )
-        return pinned_tensor.untyped_storage()
-    
-    def is_pinned(self, device="cuda"):
-        r"""
-        检查存储是否已在锁定内存中
-        """
-        pass
-```
+# 创建 pinned memory DataLoader
+dataloader = DataLoader(
+    dataset,
+    batch_size=32,
+    pin_memory=True,  # 使用页锁定内存
+    num_workers=4
+)
 
-### 4.5 异步数据传输示例
-
-```python
-# 创建 CPU Tensor 并移到 pinned memory
-x = torch.randn(1000, 1000, pin_memory=True)  # 等价于 pin_memory()
-
-# 异步传输到 GPU
-y = x.cuda(non_blocking=True)
-
-# 可以做其他操作，传输在后台进行
-# ...
-
-# 等待传输完成（如果需要）
-torch.cuda.synchronize()
+# 或者手动创建 pinned tensor
+tensor = torch.empty(1000, pin_memory=True)
+tensor_cuda = tensor.cuda(non_blocking=True)  # 异步传输
 ```
 
 ---
 
-## 05. 内存布局与格式
+## 7. TypedStorage 与 UntypedStorage
 
-### 5.1 连续与非连续 Tensor
+### 7.1 类型化 Storage
 
 ```python
-x = torch.randn(3, 4)
-print(x.is_contiguous())  # True
+# TypedStorage (推荐)
+storage = torch.storage.TypedStorage(
+    wrap_storage=untyped_storage,
+    dtype=torch.float32
+)
 
-# 转置后变为非连续
-y = x.t()
-print(y.is_contiguous())  # False
-
-# 创建连续副本
-z = y.contiguous()
-print(z.is_contiguous())  # True
+# 或者从 Tensor 获取
+tensor = torch.randn(10)
+typed_storage = tensor.storage()  # TypedStorage
 ```
 
-### 5.2 内存格式
+### 7.2 UntypedStorage
 
 ```python
-# 获取内存格式
-print(x.memory_format)  # torch.contiguous_format
+# UntypedStorage (底层，无类型信息)
+tensor = torch.randn(10)
+untyped_storage = tensor.untyped_storage()
 
-# 创建指定格式的 Tensor
-x = torch.randn(3, 4, memory_format=torch.channels_last)
-x = torch.randn(3, 4, memory_format=torch.preserve_format)
+# 从 UntypedStorage 创建 TypedStorage
+typed = torch.storage.TypedStorage(
+    wrap_storage=untyped_storage,
+    dtype=torch.float32,
+    _internal=True
+)
 ```
 
-### 5.3 stride 与 storage_offset
+### 7.3 迁移指南
 
 ```python
-x = torch.randn(3, 4)
-print(x.stride())       # (4, 1) - 行优先
-print(x.storage_offset())  # 0
+# 旧代码 (已废弃)
+storage = tensor.storage()  # 返回 TypedStorage，但有警告
 
-# 切片后的 Tensor
-y = x[1:, 1:]
-print(y.stride())       # (4, 1) - stride 不变
-print(y.storage_offset())  # 5 (1*4 + 1) - 偏移量增加
-print(y.size())         # (2, 3)
-```
-
----
-
-## 06. 序列化的存储处理
-
-### 6.1 Storage 序列化
-
-**源码位置**: `torch/storage.py:245-248`
-
-```python
-class _StorageBase:
-    def __reduce__(self):
-        """pickle 序列化支持"""
-        b = io.BytesIO()
-        torch.save(self, b, _use_new_zipfile_serialization=False)
-        return (_load_from_bytes, (b.getvalue(),))
-
-
-def _load_from_bytes(b):
-    """从字节加载 Storage"""
-    return torch.load(io.BytesIO(b))
-```
-
-### 6.2 _rebuild_tensor
-
-**源码位置**: `torch/_utils.py:193-196`
-
-```python
-def _rebuild_tensor(storage, storage_offset, size, stride):
-    """
-    从 Storage 重建 Tensor
-    
-    Args:
-        storage: TypedStorage 或 UntypedStorage
-        storage_offset: 在 Storage 中的偏移
-        size: Tensor 形状
-        stride: Tensor 步幅
-    
-    Returns:
-        重建的 Tensor
-    """
-    # 首先创建正确 dtype/device 的 Tensor
-    t = torch.empty((0,), dtype=storage.dtype, device=storage._untyped_storage.device)
-    return t.set_(storage._untyped_storage, storage_offset, size, stride)
-```
-
-### 6.3 序列化中的注意事项
-
-**Note [Don't serialize hooks]** (`torch/_utils.py:154-188`):
-
-```python
-# 向后钩子不再序列化，原因:
-# 1. 脆弱：函数重命名会导致无法加载
-# 2. 不常用：推荐保存 state_dict 而非完整模型
-# 3. DDP 等框架会自行重新添加钩子
-
-# 序列化时会发出警告（如果 Tensor 有钩子）
-def warn_if_has_hooks(tensor):
-    if tensor._backward_hooks:
-        warnings.warn(
-            "Backward hooks are not serialized and will be lost"
-        )
+# 新代码
+untyped_storage = tensor.untyped_storage()  # 获取 UntypedStorage
+typed_storage = tensor.storage()  # 仍然可用，但未来会移除
 ```
 
 ---
 
-## 附录：Storage API 快速参考
+## 8. 关键源码索引
 
-### 创建 Storage
-
-```python
-# CPU Storage
-storage = torch.UntypedStorage(100)  # 100 个元素
-storage = torch.FloatStorage([1.0, 2.0, 3.0])  # 从列表
-
-# CUDA Storage
-storage = torch.cuda.UntypedStorage(100)
-storage = torch.cuda.FloatStorage(100)
-
-# 从 Tensor 获取
-storage = tensor.untyped_storage()
-storage = tensor.storage()  # TypedStorage (已弃用)
-```
-
-### Storage 操作
-
-```python
-len(storage)              # 元素数量
-storage.nbytes()          # 字节数
-storage.element_size()    # 每元素字节数
-storage.data_ptr()        # 数据指针
-storage.device            # 设备
-storage.clone()           # 副本
-storage.copy_(src)        # 复制数据
-storage.resize_(size)     # 调整大小
-```
-
-### 类型转换
-
-```python
-storage.float()           # float 类型
-storage.double()          # double 类型
-storage.int()             # int 类型
-# ... 其他类型
-```
-
-### 内存管理
-
-```python
-storage.share_memory_()   # 共享内存
-storage.is_shared()       # 检查是否共享
-storage.pin_memory()      # 锁定内存 (CPU only)
-storage.is_pinned()       # 检查是否锁定
-```
-
-### CUDA 内存统计
-
-```python
-torch.cuda.memory_allocated()           # 已分配内存
-torch.cuda.memory_reserved()            # 缓存内存
-torch.cuda.max_memory_allocated()       # 峰值分配
-torch.cuda.empty_cache()                # 清空缓存
-torch.cuda.reset_peak_memory_stats()    # 重置峰值统计
-```
+| 文件 | 行号 | 内容 |
+|------|------|------|
+| `torch/csrc/Storage.cpp` | L35-L103 | THPStorage 定义与 dealloc |
+| `torch/csrc/Storage.cpp` | L105-L250 | THPStorage_pynew 构造 |
+| `torch/csrc/StorageSharing.cpp` | - | 共享内存实现 |
+| `c10/core/StorageImpl.h` | - | StorageImpl 完整定义 |
+| `c10/core/CPUAllocator.cpp` | - | CPU 分配器 |
+| `c10/cuda/CUDACachingAllocator.h` | - | CUDA 缓存分配器 |
 
 ---
 
-## 后续章节
+## 9. 下一步
 
-- [05. 工厂函数实现](./05-factory-functions.md) - Tensor 创建机制
-- [06. Dispatcher 调度系统](./06-dispatcher.md) - Dispatch Key 机制
+| 章节 | 主题 |
+|------|------|
+| [Part 5](./05-factory-functions.md) | 工厂函数详解 |
+| [Part 6](./06-dispatcher.md) | 分发机制 |
+
+---
+
+**参考资料**:
+- `torch/csrc/Storage.cpp` - Python Storage 绑定
+- `c10/core/Storage.h` - C++ Storage 定义
+- `c10/core/StorageImpl.h` - StorageImpl 实现
+- `c10/core/CPUAllocator.cpp` - CPU 内存分配
+- `c10/cuda/CUDACachingAllocator.h` - CUDA 缓存分配
