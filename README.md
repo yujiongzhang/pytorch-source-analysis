@@ -74,14 +74,30 @@ Inductor 是 PyTorch 2.0 引入的新一代深度学习编译器，作为 `torch
   - `proxy.py` - 代理张量
 - **学习重点**: 图构建、模式匹配、图重写
 
-### 4. ATen - 核心算子库
+### 4. ATen - 核心算子库 ✅
 
-- **源码位置**: `torch/csrc/aten/`
+- **源码位置**: `aten/src/ATen/`
 - **核心功能**: 底层张量操作实现
 - **关键文件**:
   - `src/ATen/` - C++ 算子实现
   - `native/` - 原生实现后端
+  - `native/native_functions.yaml` - 算子声明
+  - `core/dispatch/` - Dispatch 机制
 - **学习重点**: 算子注册、Dispatch 机制、Kernel 实现
+
+| 序号 | 文档 | 内容概述 |
+|------|------|----------|
+| 00 | [文档规划](./_aten/00-plan.md) | 整体结构、学习路线 |
+| 01 | [架构概览](./_aten/01-architecture.md) | ATen 是什么、目录结构、核心概念 |
+| 02 | [算子声明系统](./_aten/02-native-functions-yaml.md) | native_functions.yaml 格式详解 |
+| 03 | [Dispatch 机制](./_aten/03-dispatch-mechanism.md) | Dispatcher、DispatchKey、注册与调用 |
+| 04 | [C++ Kernel 实现](./_aten/04-kernel-implementation.md) | DispatchStub、TensorIterator、Kernel 模式 |
+| 05 | [注册机制](./_aten/05-registration.md) | REGISTER_DISPATCH 宏、算子注册流程 |
+| 06 | [AT_DISPATCH 宏](./_aten/06-dispatch-macro.md) | 类型分发宏家族、AT_DISPATCH_V2 |
+| 07 | [Tensor 数据结构](./_aten/07-tensor-structure.md) | TensorImpl、Storage、视图机制 |
+| 08 | [自动微分集成](./_aten/08-autograd-integration.md) | derivatives.yaml、AutogradComposite |
+| 09 | [后端扩展指南](./_aten/09-backend-extension.md) | 新后端实现、BackendFallback |
+| 10 | [调试与测试](./_aten/10-debugging-testing.md) | 测试框架、调试工具、OpInfo |
 
 ### 5. 分布式训练
 
