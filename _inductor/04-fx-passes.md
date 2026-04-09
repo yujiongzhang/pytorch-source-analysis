@@ -377,84 +377,6 @@ B2B_GEMM_PASS = PatternMatcherPass(pass_name="b2b_gemm_pass")
 # (A @ B) @ C → fused_b2b_gemm(A, B, C)
 ```
 
-### 4.3 DDP 通信融合
-
-**文件**: `torch/_inductor/fx_passes/ddp_fusion.py`
-
-**文件**: `torch/_inductor/fx_passes/ddp_fusion.py:63-100`
-
-```python
-@dataclass(unsafe_hash=True)
-class CommBlock:
-    """
-    通信块表示
-    
-    Attributes:
-        shape: 通信数据的形状
-        node_list: 属于该通信块的节点列表
-        inputs: 输入节点
-        wait_nodes: 等待节点（异步通信完成）
-        comm_node: 通信节点（如 allreduce）
-        outputs: 输出节点集合
-    """
-    shape: torch.Size | list[torch.Size]
-    node_list: list[fx.Node]
-    inputs: list[fx.Node]
-    wait_nodes: list[fx.Node]
-    comm_node: fx.Node
-    outputs: OrderedSet[fx.Node]
-
-
-def get_comm_block(comm_node: fx.Node) -> CommBlock | None:
-    """
-    给定一个 collective 节点（如 allreduce），找出属于该通信的所有节点
-    
-    Args:
-        comm_node: 目标通信/collective 节点
-    
-    Returns:
-        封装相关节点（如 wait_node）的 CommBlock
-    """
-    node_list = []
-    wait_nodes = []
-    inputs, _ = tree_flatten((comm_node.args, comm_node.kwargs))
-    input_nodes = [inp for inp in inputs if isinstance(inp, fx.Node)]
-    
-    # L90: 中间输出操作类型
-    intermediate_outputs = ("split", "reshape", "getitem", "detach", "alias")
-
-    # L92-100: 处理只有一个用户的简单情况
-    first_user = next(iter(comm_node.users))
-    if (
-        len(comm_node.users) == 1
-        and first_user.target is torch.ops._c10d_functional.wait_tensor.default
-    ):
-        # Collective with only one output
-        node_list = [comm_node, first_user]
-        wait_nodes.append(first_user)
-```
-
-**融合效果**:
-
-```mermaid
-graph TB
-    subgraph "融合前"
-        A[Gradient1] --> D[AllReduce1]
-        B[Gradient2] --> E[AllReduce2]
-        C[Gradient3] --> F[AllReduce3]
-        D --> G[Wait1]
-        E --> H[Wait2]
-        F --> I[Wait3]
-    end
-    
-    subgraph "融合后"
-        J[Concat Gradients] --> K[Single AllReduce]
-        K --> L[Split & Wait]
-    end
-```
-
----
-
 ## 5. Post-Grad Passes 详解
 
 ### 5.1 入口函数
@@ -556,7 +478,85 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
         )
 ```
 
-### 5.2 Post-Grad Pass 列表
+### 5.2 DDP 通信融合
+
+**文件**: `torch/_inductor/fx_passes/ddp_fusion.py`
+
+**文件**: `torch/_inductor/fx_passes/ddp_fusion.py:63-100`
+
+```python
+@dataclass(unsafe_hash=True)
+class CommBlock:
+    """
+    通信块表示
+    
+    Attributes:
+        shape: 通信数据的形状
+        node_list: 属于该通信块的节点列表
+        inputs: 输入节点
+        wait_nodes: 等待节点（异步通信完成）
+        comm_node: 通信节点（如 allreduce）
+        outputs: 输出节点集合
+    """
+    shape: torch.Size | list[torch.Size]
+    node_list: list[fx.Node]
+    inputs: list[fx.Node]
+    wait_nodes: list[fx.Node]
+    comm_node: fx.Node
+    outputs: OrderedSet[fx.Node]
+
+
+def get_comm_block(comm_node: fx.Node) -> CommBlock | None:
+    """
+    给定一个 collective 节点（如 allreduce），找出属于该通信的所有节点
+    
+    Args:
+        comm_node: 目标通信/collective 节点
+    
+    Returns:
+        封装相关节点（如 wait_node）的 CommBlock
+    """
+    node_list = []
+    wait_nodes = []
+    inputs, _ = tree_flatten((comm_node.args, comm_node.kwargs))
+    input_nodes = [inp for inp in inputs if isinstance(inp, fx.Node)]
+    
+    # L90: 中间输出操作类型
+    intermediate_outputs = ("split", "reshape", "getitem", "detach", "alias")
+
+    # L92-100: 处理只有一个用户的简单情况
+    first_user = next(iter(comm_node.users))
+    if (
+        len(comm_node.users) == 1
+        and first_user.target is torch.ops._c10d_functional.wait_tensor.default
+    ):
+        # Collective with only one output
+        node_list = [comm_node, first_user]
+        wait_nodes.append(first_user)
+```
+
+**融合效果**:
+
+```mermaid
+graph TB
+    subgraph "融合前"
+        A[Gradient1] --> D[AllReduce1]
+        B[Gradient2] --> E[AllReduce2]
+        C[Gradient3] --> F[AllReduce3]
+        D --> G[Wait1]
+        E --> H[Wait2]
+        F --> I[Wait3]
+    end
+    
+    subgraph "融合后"
+        J[Concat Gradients] --> K[Single AllReduce]
+        K --> L[Split & Wait]
+    end
+```
+
+---
+
+### 5.3 Post-Grad Pass 列表
 
 **文件**: `torch/_inductor/fx_passes/split_cat.py`
 
@@ -703,14 +703,244 @@ sequenceDiagram
     GM->>PG: 原始 FX 图
     Note over PG: NumPy 标准化<br/>Group Batch Fusion<br/>Conv-BN 融合
     PG->>JG: 优化的 Pre-Grad 图
-    Note over JG: B2B GEMM<br/>DDP 融合
+    Note over JG: B2B GEMM
     JG->>AG: AOTAutograd 分离
     AG->>PoG: Forward/Backward 图
-    Note over PoG: DCE<br/>最终融合<br/>通信优化
+    Note over PoG: DCE<br/>最终融合<br/>DDP 通信融合
     PoG->>GM: 最终优化图
 ```
 
-### 8.2 配置项
+### 8.2 Pass 执行流程图
+
+---
+
+## 9. 源码阅读指南
+
+### 9.1 核心文件索引
+
+| 文件 | 行号范围 | 内容 |
+|------|----------|------|
+| `pre_grad.py` | L287-370 | `pre_grad_passes` 主函数 |
+| `pre_grad.py` | L59-67 | `lazy_init` 初始化 |
+| `post_grad.py` | L113-217 | `post_grad_passes` 主函数 |
+| `post_grad.py` | L726+ | `lazy_init` 初始化 |
+| `joint_graph.py` | L82-86 | `pass_patterns` 定义 |
+| `split_cat.py` | L48-97 | Pass 名称列表和注册表 |
+| `efficient_conv_bn_eval.py` | L17-76 | Conv-BN 融合实现 |
+| `ddp_fusion.py` | L63-100 | `CommBlock` 数据类 (Post-Grad) |
+| `group_batch_fusion.py` | ~L400 | `group_batch_fusion_passes` |
+| `memory_estimator.py` | L17-67 | `GraphAliasTracker` 类 |
+
+### 9.2 推荐阅读顺序
+
+```
+1. torch/_inductor/fx_passes/pre_grad.py (Pre-Grad 入口)
+2. torch/_inductor/fx_passes/post_grad.py (Post-Grad 入口)
+3. torch/_inductor/fx_passes/split_cat.py (Pass 列表定义)
+4. torch/_inductor/fx_passes/efficient_conv_bn_eval.py (Conv-BN 融合)
+5. torch/_inductor/fx_passes/group_batch_fusion.py (批量融合)
+6. torch/_inductor/fx_passes/ddp_fusion.py (DDP 通信融合，Post-Grad)
+7. torch/_inductor/fx_passes/memory_estimator.py (内存估计)
+8. torch/_inductor/pattern_matcher.py (模式匹配器)
+```
+
+---
+
+## 10. 三阶段 Pass 详细列表
+
+### 10.1 Pre-Grad Passes（完整列表）
+
+**执行时机**: AOTAutograd 追踪之前，IR 未 functionalized/normalized
+
+**入口函数**: `torch/_inductor/fx_passes/pre_grad.py:pre_grad_passes()`
+
+#### 10.1.1 模式匹配 Passes（PRE_GRAD_PATTERNS）
+
+| Pass 名称 | 描述 | 典型模式 |
+|----------|------|---------|
+| `normalization_pass` | NumPy 兼容性标准化 | 将 NumPy 风格操作标准化 |
+| `remove_split_with_size_one_pass` | 移除 split size=1 | `split(x, 1)` → `unsqueeze` |
+| `merge_getitem_cat_pass` | 合并 getitem+cat | 反向操作抵消 |
+| `merge_stack_tahn_unbind_pass` | 合并 stack+tanh+unbind | 激活函数融合 |
+| `merge_splits_pass` | 合并多个 splits | 减少 split 操作数量 |
+| `mutate_cat_pass` | Cat 变异优化 | 原地 cat 操作 |
+| `split_cat_pass` | Split-Cat 融合 | `cat(split(x))` → `x` |
+| `unbind_stack_pass` | Unbind-Stack 融合 | `stack(unbind(x))` → `x` |
+| `split_cat_to_slices_pass` | Split-Cat 转切片 | 转为切片操作 |
+| `unbind_cat_to_view_pass` | Unbind-Cat 转 view | 转为 view 操作 |
+| `split_stack_to_cats_pass` | Split-Stack 转 cat | 转为 cat 操作 |
+| `unbind_stack_to_slices_pass` | Unbind-Stack 转切片 | 转为切片操作 |
+| `move_reshape_out_of_split_stack_pass` | 移动 reshape | 优化 reshape 位置 |
+| `einsum_to_pointwise_pass` | Einsum 转 pointwise | 转为点积操作 |
+
+#### 10.1.2 Group Batch Fusion Passes（PRE_GRAD_FUSIONS）
+
+| Pass 名称 | 描述 | 典型模式 |
+|----------|------|---------|
+| `batch_linear_lhs` | 批量 Linear（左乘） | 多个线性变换合并 |
+| `batch_linear` | 批量 Linear | `[linear(x_i) for i in range(n)]` |
+| `batch_layernorm` | 批量 LayerNorm | 多个 LayerNorm 合并 |
+| `batch_tanh` | 批量 Tanh | `[tanh(x_i) for i in range(n)]` |
+| `batch_sigmoid` | 批量 Sigmoid | `[sigmoid(x_i) for i in range(n)]` |
+| `batch_relu` | 批量 ReLU | `[relu(x_i) for i in range(n)]` |
+| `batch_detach` | 批量 Detach | 多个 detach 合并 |
+| `batch_nan_to_num` | 批量 NanToNum | 多个 nan_to_num 合并 |
+| `batch_clamp` | 批量 Clamp | 多个 clamp 合并 |
+| `batch_dropout` | 批量 Dropout | 多个 dropout 合并 |
+
+#### 10.1.3 其他 Pre-Grad 优化
+
+| 优化名称 | 描述 | 源码位置 |
+|---------|------|---------|
+| `fuse_fx` | FX 图融合（含 Permute 融合） | `pre_grad.py:391` |
+| `efficient_conv_bn_eval_pass` | Conv-BN 融合（Eval 模式） | `pre_grad.py:350` |
+| `apply_gumbel_max_trick_pass` | Gumbel-Max Trick | `pre_grad.py:353` |
+| `quant_lift_up` | 量化提升 | `pre_grad.py:364` |
+| `linear_permute_fusion` | Linear+Permute 融合 | `pre_grad.py:749` |
+| `permute_linear_fusion` | Permute+Linear 融合 | `pre_grad.py:790` |
+| `permute_matmul_fusion` | Permute+Matmul 融合 | `pre_grad.py:824` |
+| `fuse_conv_bn` | Conv-BN 模块融合 | `pre_grad.py:447` |
+| `remove_identity` | 移除 Identity 层 | `pre_grad.py:431` |
+
+---
+
+### 10.2 Joint Graph Passes（完整列表）
+
+**执行时机**: AOTAutograd 分离前后向图之后，同时处理 forward 和 backward
+
+**入口函数**: `torch/_inductor/fx_passes/joint_graph.py:joint_graph_passes()`
+
+#### 10.2.1 核心优化
+
+| Pass 名称 | 描述 | 典型模式 |
+|----------|------|---------|
+| `canonicalize_aten_ir_passes` | ATen IR 标准化 | 量化映射标准化 |
+| `constant_fold_uniform_value` | 常量折叠（均匀值） | `full([shape], value)` |
+| `remove_no_op` | 移除无操作 | `+0`, `-0`, `*1`, `/1` |
+| `remove_redundant_views` | 移除冗余 view | 重复的 `view.dtype` |
+| `auto_chunker` | 自动 Chunk | `chunk()` 模式匹配 |
+| `replace_random_passes` | 随机操作替换 | 随机数生成优化 |
+
+#### 10.2.2 模式匹配 Passes（patterns）
+
+| Pass 名称 | 描述 | 典型模式 |
+|----------|------|---------|
+| `fix_iota_device` | Iota 设备修复 | `arange(cpu)` → `arange(cuda)` |
+| `pointless_convert` | 冗余类型转换 | `convert(convert(x))` |
+| `pointless_view` | 冗余 View | `view(x, x.shape)` → `x` |
+| `pointless_view_pair` | 冗余 View 对 | `view(view(x))` → `x` |
+| `pointless_permute_pair` | 冗余 Permute 对 | `permute(permute(x))` → `x` |
+| `bmm_to_mm` | BMM 转 MM | `bmm(x[0:1], y[0:1])` → `mm` |
+| `mul_softmax_pattern` | Mul-Softmax 优化 | `scale * softmax(x)` |
+| `div_softmax_pattern` | Div-Softmax 优化 | `softmax(x) / scale` |
+| `scatter_upon_const_tensor` | Scatter+Full 融合 | `scatter(full(...))` → `where` |
+
+---
+
+### 10.3 Post-Grad Passes（完整列表）
+
+**执行时机**: Functionalization 和 Normalization 之后
+
+**入口函数**: `torch/_inductor/fx_passes/post_grad.py:post_grad_passes()`
+
+#### 10.3.1 基础优化
+
+| Pass 名称 | 描述 | 源码位置 |
+|----------|------|---------|
+| `remove_fsdp2_unsharded_param_graph_input_usage` | 移除 FSDP2 未分片参数使用 | `post_grad.py:126` |
+| `eliminate_dead_code` | 死代码消除（DCE） | `post_grad.py:128` |
+| `reorder_for_locality` | 局部性重排序（推理模式） | `post_grad.py:132` |
+| `remove_profiler_ops` | 移除 Profiler 操作 | `post_grad.py:160` |
+| `remove_noop_ops` | 移除无操作 | `post_grad.py:170` |
+| `remove_assert_ops` | 移除 Assert 操作 | `post_grad.py:171` |
+
+#### 10.3.2 Group Batch Fusion Passes（POST_GRAD_FUSIONS）
+
+| Pass 名称 | 描述 | 典型模式 |
+|----------|------|---------|
+| `batch_linear_post_grad` | 批量 Linear（Post-Grad） | 后向传播中的批量线性 |
+| `group_linear` | 分组 Linear | 分组线性变换 |
+| `batch_aten_tanh` | ATen Tanh 批量 | `aten.tanh` 批量 |
+| `batch_aten_sigmoid` | ATen Sigmoid 批量 | `aten.sigmoid` 批量 |
+| `batch_aten_relu` | ATen ReLU 批量 | `aten.relu` 批量 |
+| `batch_aten_add` | ATen Add 批量 | `aten.add` 批量 |
+| `batch_aten_sub` | ATen Sub 批量 | `aten.sub` 批量 |
+| `batch_aten_div` | ATen Div 批量 | `aten.div` 批量 |
+| `batch_aten_mul` | ATen Mul 批量 | `aten.mul` 批量 |
+
+#### 10.3.3 模式匹配 Passes（POST_GRAD_PATTERNS）
+
+| Pass 名称 | 描述 | 典型模式 |
+|----------|------|---------|
+| `normalization_aten_pass` | ATen 标准化 | ATen IR 标准化 |
+| `decompose_mm_pass` | MM 分解 | 矩阵乘法分解 |
+| `unbind_stack_aten_pass` | Unbind-Stack（ATen） | `unbind+stack` 融合 |
+| `shape_padding_multiplier` | Shape Padding | 形状填充优化 |
+| `pad_aten_mm_pass` | Pad-MM 融合 | `pad+mm` 融合 |
+| `split_cat_aten_pass` | Split-Cat（ATen） | `split+cat` 融合 |
+| `select_cat_aten_pass` | Select-Cat 融合 | `select+cat` 融合 |
+| `move_view_after_cat_aten_pass` | 移动 View | `view` 移到 `cat` 后 |
+
+#### 10.3.4 高级优化
+
+| Pass 名称 | 描述 | 源码位置 |
+|----------|------|---------|
+| `grouped_gemm_pass` | 分组 GEMM（MKL-DNN） | `post_grad.py:150` |
+| `concat_linear_woq_int4` | Concat-Linear（WOQ Int4） | `post_grad.py:154` |
+| `partitioned_scatter_optimization_pass` | 分区 Scatter 优化 | `post_grad.py:178` |
+| `B2B_GEMM_PASS` | Back-to-Back GEMM 融合 | `post_grad.py:204` |
+| `fuse_ddp_communication` | DDP 通信融合 | `post_grad.py:210` |
+| `micro_pipeline_tp_pass` | Micro-Pipeline TP | `post_grad.py:207` |
+
+#### 10.3.5 分布式通信 Bucketing
+
+| Pass 名称 | 描述 | 配置项 |
+|----------|------|--------|
+| `bucket_reduce_scatters` | Reduce-Scatter 分桶 | `bucket_reduce_scatters_fx` |
+| `bucket_all_reduces` | All-Reduce 分桶 | `bucket_all_reduces_fx` |
+| `bucket_all_gathers` | All-Gather 分桶 | `bucket_all_gathers_fx` |
+
+#### 10.3.6 重叠调度
+
+| Pass 名称 | 描述 | 配置项 |
+|----------|------|--------|
+| `schedule_overlap_bucketing_from_inductor_configs` | 重叠调度 | `aten_distributed_optimizations` |
+
+#### 10.3.7 变异操作处理（保持 invariant）
+
+| Pass 名称 | 描述 | 源码位置 |
+|----------|------|---------|
+| `reinplace_inplaceable_ops` | 原地操作替换 | `post_grad.py:352` |
+| `decompose_triton_kernel_wrapper_functional` | Triton Kernel 分解 | `post_grad.py:356` |
+| `decompose_auto_functionalized` | Auto-Functionalized 分解 | `post_grad.py:358` |
+| `reinplace_fsdp_all_gather` | FSDP All-Gather 原地化 | `post_grad.py:362` |
+| `decompose_scan_to_while_loop` | Scan 转 While-Loop | `post_grad.py:365` |
+| `decompose_map_to_while_loop` | Map 转 While-Loop | `post_grad.py:368` |
+
+---
+
+## 11. 总结
+
+本章详细介绍了 PyTorch Inductor 的图优化 Passes 系统：
+
+1. **三阶段架构**: Pre-Grad → Joint Graph → Post-Grad
+2. **核心优化**:
+   - Group Batch Fusion：批量融合
+   - Efficient Conv-BN Eval：Conv-BN 合并
+   - Split-Cat 优化：Transformer 常见模式
+   - DDP 通信融合：分布式训练优化
+3. **模式匹配器**: 声明式定义和替换图模式
+4. **内存估计**: 追踪存储分配和使用，优化内存布局
+
+图优化 Passes 是 Inductor 性能优化的关键环节，通过消除冗余操作、融合可合并的算子、优化内存使用等方式，显著提升生成的机器代码的执行效率。
+
+---
+
+**下一篇**: [PyTorch Inductor 源码解析（五）：调度算法与算子融合](./05-scheduler.md)
+
+---
+
+## 附录：Pass 配置示例
 
 ```python
 import torch._inductor.config as config
@@ -739,61 +969,23 @@ config.reorder_for_locality = True
 
 # DDP 通信融合
 config._fuse_ddp_communication = True
+config._fuse_ddp_communication_passes = ["fuse_ddp_with_concat_op"]
+config._fuse_ddp_bucket_size = 256  # MB
 
 # 自定义 Pass
 config.pre_grad_custom_pass = my_custom_pass
 config.post_grad_custom_pre_pass = my_custom_pre_pass
+config.joint_custom_pre_pass = my_joint_pre_pass
+config.joint_custom_post_pass = my_joint_post_pass
+config.post_grad_custom_post_pass = my_post_pass
+
+# Bucketing 配置
+config.bucket_reduce_scatters_fx = "size"  # 或 "none"
+config.bucket_all_reduces_fx = "size"
+config.bucket_all_gathers_fx = "none"
+
+# 重叠调度配置
+config.aten_distributed_optimizations.enable_overlap_scheduling = True
+config.aten_distributed_optimizations.insert_overlap_deps = True
+config.aten_distributed_optimizations.enable_fusion_regions = True
 ```
-
----
-
-## 9. 源码阅读指南
-
-### 9.1 核心文件索引
-
-| 文件 | 行号范围 | 内容 |
-|------|----------|------|
-| `pre_grad.py` | L287-370 | `pre_grad_passes` 主函数 |
-| `pre_grad.py` | L59-67 | `lazy_init` 初始化 |
-| `post_grad.py` | L113-212 | `post_grad_passes` 主函数 |
-| `post_grad.py` | L726+ | `lazy_init` 初始化 |
-| `joint_graph.py` | L82-86 | `pass_patterns` 定义 |
-| `split_cat.py` | L48-97 | Pass 名称列表和注册表 |
-| `efficient_conv_bn_eval.py` | L17-76 | Conv-BN 融合实现 |
-| `ddp_fusion.py` | L63-100 | `CommBlock` 数据类 |
-| `group_batch_fusion.py` | ~L400 | `group_batch_fusion_passes` |
-| `memory_estimator.py` | L17-67 | `GraphAliasTracker` 类 |
-
-### 9.2 推荐阅读顺序
-
-```
-1. torch/_inductor/fx_passes/pre_grad.py (Pre-Grad 入口)
-2. torch/_inductor/fx_passes/post_grad.py (Post-Grad 入口)
-3. torch/_inductor/fx_passes/split_cat.py (Pass 列表定义)
-4. torch/_inductor/fx_passes/efficient_conv_bn_eval.py (Conv-BN 融合)
-5. torch/_inductor/fx_passes/ddp_fusion.py (通信融合)
-6. torch/_inductor/fx_passes/group_batch_fusion.py (批量融合)
-7. torch/_inductor/fx_passes/memory_estimator.py (内存估计)
-8. torch/_inductor/pattern_matcher.py (模式匹配器)
-```
-
----
-
-## 10. 总结
-
-本章详细介绍了 PyTorch Inductor 的图优化 Passes 系统：
-
-1. **三阶段架构**: Pre-Grad → Joint Graph → Post-Grad
-2. **核心优化**:
-   - Group Batch Fusion：批量融合
-   - Efficient Conv-BN Eval：Conv-BN 合并
-   - Split-Cat 优化：Transformer 常见模式
-   - DDP 通信融合：分布式训练优化
-3. **模式匹配器**: 声明式定义和替换图模式
-4. **内存估计**: 追踪存储分配和使用，优化内存布局
-
-图优化 Passes 是 Inductor 性能优化的关键环节，通过消除冗余操作、融合可合并的算子、优化内存使用等方式，显著提升生成的机器代码的执行效率。
-
----
-
-**下一篇**: [PyTorch Inductor 源码解析（五）：调度算法与算子融合](./05-scheduler.md)

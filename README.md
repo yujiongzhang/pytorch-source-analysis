@@ -10,7 +10,7 @@
 
 ## 源码位置
 
-- **PyTorch 源码**: `/home/zhangyujiong/zyj_ws/torch/pytorch`
+- **PyTorch 源码**: https://github.com/pytorch/pytorch/tree/v2.11.0
 - **PyTorch 版本**: v2.11.0 (main 分支)
 
 ---

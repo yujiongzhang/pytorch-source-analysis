@@ -713,83 +713,226 @@ def expand_lowering(x: TensorBox, size: list[int]) -> TensorBox:
 
 ### 7.1 矩阵乘法
 
-**文件**: `torch/_inductor/lowering.py`
+**文件**: `torch/_inductor/kernel/mm.py:304`
 
 ```python
-# torch/_inductor/lowering.py: ~L1800
+# torch/_inductor/kernel/mm.py:304
 @register_lowering(aten.mm, type_promotion_kind=None)
-def mm_lowering(a: TensorBox, b: TensorBox) -> TensorBox:
+def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
     """
-    矩阵乘法 Lowering
-    
-    根据设备类型选择不同实现:
-    - GPU: 使用 Triton 模板或 cuBLAS
-    - CPU: 使用 MKL 或 C++ 模板
+    Lowering for autotuning aten.mm with different backends (Aten, Triton, CUTLASS, etc.)
     """
-    # 添加布局约束：需要特定 stride 顺序
-    add_needs_realized_inputs([aten.mm])
-    
-    # 根据设备选择后端
-    if is_gpu(a.get_device()):
-        return triton_mm_lowering(a, b)
-    else:
-        return cpp_mm_lowering(a, b)
+    # 类型检查
+    if out_dtype is not None:
+        input_dtype = mat1.get_dtype()
+        torch._check(
+            mat2.get_dtype() == input_dtype,
+            lambda: "input dtypes must be the same",
+        )
+        torch._check(
+            mat1.get_device().type in ("cuda", "xpu"),
+            lambda: "out_dtype is only supported for CUDA or XPU",
+        )
+        torch._check(
+            out_dtype == input_dtype
+            or (
+                out_dtype == torch.float32
+                and input_dtype in (torch.float16, torch.bfloat16)
+            ),
+            lambda: "out_dtype must be the same as input dtype or fp32 for fp16/bf16 inputs",
+        )
+
+    # 路径 1: 使用 native matmul (通过 ops.dot 实现)
+    # 核心思想：将矩阵乘法转换为广播乘法后求和
+    # C = A @ B  等价于  (A.unsqueeze(-1) * B.unsqueeze(0)).sum(dim=1)
+    # 使用 ops.dot 和 ops.reduction("dot") 直接 lowered 到 tl.dot
+    if use_native_matmul(mat1, mat2):
+        mat1 = lowerings[aten.unsqueeze](mat1, -1)
+        mat2 = lowerings[aten.unsqueeze](mat2, 0)
+        args, kwargs = transform_args(
+            args=[mat1, mat2],
+            kwargs={},
+            broadcast=True,
+            type_promotion_kind=None,
+            convert_input_to_bool=False,
+        )  # 处理广播
+
+        if inductor_config.triton.codegen_upcast_to_fp32 and mat1.dtype in [
+            torch.float16,
+            torch.bfloat16,
+        ]:
+            def _to_dtype(x):
+                return ops.to_dtype(x, mat1.dtype, use_compute_types=False)
+            args = [make_pointwise(_to_dtype)(x) for x in args]
+
+        mul_pointwise = make_pointwise(ops.dot)(*args)
+        dot_reduction = make_reduction("dot")(mul_pointwise, 1)
+        return dot_reduction
+
+    # 路径 2: 使用模板后端 (Triton/CUTLASS/CK 等)
+    m, n, k, layout, mat1, mat2 = mm_args(
+        mat1, mat2, layout=layout, out_dtype=out_dtype
+    )
+    # 获取 autotuning 选择器
+    choices: list[ChoiceCaller] = []
+    # ... 添加各种后端选择器 (Aten/cuBLAS, Triton, CUTLASS, CK 等)
+    # 最终通过 MaxAutotune 选择最优实现
 ```
 
 ### 7.2 卷积
 
+**文件**: `torch/_inductor/kernel/conv.py:416`
+
 ```python
-# torch/_inductor/lowering.py: ~L1900
-@register_lowering(aten.convolution, type_promotion_kind=None)
-def conv_lowering(
+# torch/_inductor/kernel/conv.py:416
+@register_lowering(aten.convolution)
+def convolution(
     x: TensorBox,
     weight: TensorBox,
     bias: Optional[TensorBox],
-    stride: list[int],
-    padding: list[int],
-    dilation: list[int],
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
     transposed: bool,
-    output_padding: list[int],
+    output_padding: Sequence[int],
     groups: int,
-) -> TensorBox:
-    """
-    卷积 Lowering
-    
-    根据配置选择实现:
-    1. 模板实现（Triton/C++）
-    2. cuDNN/cuDNNL 后端
-    3. Fallback 到 Aten
-    """
-    # 检查是否使用模板
-    if config.use_template_backend:
-        return template_conv_lowering(...)
-    
-    # 检查是否有专用后端
-    if has_cudnn():
-        return cudnn_conv_lowering(...)
-    
-    # Fallback
-    return fallback_handler(aten.convolution)(...)
+):
+    # 参数标准化：将序列转为 tuple，处理符号整型
+    stride = tuple(stride)
+    padding = tuple(padding)
+    dilation = tuple(dilation)
+    output_padding = tuple(output_padding)
+    if not isinstance(groups, int):
+        groups = V.graph.sizevars.guard_int(groups)
+    assert isinstance(groups, int)
+
+    # Triton template 需要静态 shape 提示
+    stride = tuple(V.graph.sizevars.guard_int_seq(stride))
+    padding = tuple(V.graph.sizevars.guard_int_seq(padding))
+
+    kwargs: ConvLayoutParams = {
+        "stride": stride,
+        "padding": padding,
+        "dilation": dilation,
+        "transposed": transposed,
+        "output_padding": output_padding,
+        "groups": groups,
+    }
+
+    # 处理 1D 卷积：升维到 2D (XPU 后端必须)
+    if len(x.get_size()) == len(weight.get_size()) - 1:
+        # 添加 batch 维度简化后续处理
+        return L[aten.squeeze](
+            convolution(L[aten.expand](x, [1, *x.get_size()]), weight, bias, **kwargs),
+            dim=0,
+        )
+
+    # 处理 XPU 上的 conv1d -> conv2d 转换
+    # 原因：channel-last 布局在 conv2d 上性能更好
+    if len(x.get_size()) == 3 and len(kernel_shape) == 1 and device_type == "xpu":
+        # (N, C, L) -> (N, C, 1, L)
+        x = L[aten.unsqueeze](x, dim=2)
+        weight = L[aten.unsqueeze](weight, dim=2)
+        return L[aten.squeeze](
+            convolution(x, weight, bias, **kwargs),
+            dim=2,
+        )
+
+    # 判断是否使用 channel-last 优化
+    def channels_last_conv():
+        if V.graph.layout_opt and ndim == 2:
+            return True
+        layout = conv_layout(x, weight, None, **kwargs)
+        req_stride_order = ir.get_stride_order(
+            V.graph.sizevars.size_hints(layout.stride)
+        )
+        return req_stride_order == ir.NHWC_STRIDE_ORDER
+
+    # 1x1 卷积优化：转换为矩阵乘法
+    autotuning_gemm = config.max_autotune or config.max_autotune_gemm
+    if (
+        (config.conv_1x1_as_mm or (autotuning_gemm and channels_last_conv()))
+        and is_ones(kernel_shape)
+        and is_ones(stride)
+        and is_zeros(padding)
+        and is_ones(dilation)
+    ):
+        # 1x1 卷积退化为矩阵乘法，性能更好
+        # ... (转换为 mm 实现)
 ```
 
 ### 7.3 索引操作
 
+**文件**: `torch/_inductor/lowering.py:2021`
+
 ```python
-# torch/_inductor/lowering.py: ~L2000
+# torch/_inductor/lowering.py:2021
 @register_lowering(aten.select, type_promotion_kind=None)
-def select_lowering(x: TensorBox, dim: int, index: int) -> TensorBox:
+def select(x, dim, idx):
     """
     aten.select 的 Lowering（索引切片）
     
-    通过修改 indexer 实现，不复制数据
+    通过 View 实现，不复制数据
     """
-    def reindex(idx):
-        # 在指定维度插入固定索引
-        new_idx = list(idx)
-        new_idx.insert(dim, sympy.Integer(index))
-        return new_idx
+    idx = sympy.expand(idx)
+    size = sympy.expand(x.get_size()[dim])
+    actual_index = None
+
+    # 处理负索引
+    if V.graph.sizevars.guard_or_false(sympy.Lt(idx, 0)):
+        actual_index = idx + size
+    elif V.graph.sizevars.guard_or_false(sympy.Ge(idx, 0)):
+        actual_index = idx
+
+    if actual_index is not None:
+        if has_free_unbacked_symbols(idx):
+            # 有 unbacked symbol 时，使用 as_strided 处理
+            # 原因：Squeeze 操作会降低为 view，导致 stride 计算错误
+            x.realize()
+            new_size = x.get_size()
+            new_stride = x.get_stride()
+            new_storage_offset = x.get_layout().offset + new_stride[dim] * actual_index
+
+            del new_size[dim]
+            del new_stride[dim]
+            return as_strided(x, new_size, new_stride, new_storage_offset)
+        else:
+            # 常规路径：slice + squeeze
+            # 1. 在 dim 维度切出 [actual_index, actual_index+1) 范围
+            # 2. squeeze 掉该维度
+            slice_result = slice_(x, dim, actual_index, actual_index + 1, clamp=False)
+            return squeeze(slice_result, dim)
+
+    # Unbacked 语义处理：
+    # 当索引 idx 是 unbacked symbol (如 u0) 时，
+    # 使用 DynamicSelectStorageOffset 在运行时动态计算 offset
+    unbacked_bindings = resolve_unbacked_bindings(
+        V.graph.sizevars.shape_env, V.graph.current_node.meta["unbacked_bindings"]
+    )
+    assert unbacked_bindings is not None
+    assert len(unbacked_bindings) == 1, unbacked_bindings
+    unbacked_offset_sym, _ = next(iter(unbacked_bindings.items()))
+
+    x.realize()
+    new_size = x.get_size()
+    new_stride = x.get_stride()
+    new_storage_offset = unbacked_offset_sym
     
-    return TensorBox(GenericView.create(x, ..., reindex))
+    # 创建动态 offset buffer
+    buffer = ir.DynamicSelectStorageOffset(
+        unbacked_offset_sym,
+        idx,
+        x.get_layout().offset,
+        new_stride[dim],
+        x.get_size()[dim],
+        clamp=False,
+    )
+    buffer.name = V.graph.register_buffer(buffer)
+    V.graph.register_operation(buffer)
+
+    del new_size[dim]
+    del new_stride[dim]
+    return as_strided(x, new_size, new_stride, new_storage_offset)
 ```
 
 ---
@@ -798,71 +941,116 @@ def select_lowering(x: TensorBox, dim: int, index: int) -> TensorBox:
 
 ### 8.1 Fallback 注册
 
-**文件**: `torch/_inductor/lowering.py`
+**文件**: `torch/_inductor/lowering.py:2192`
 
 ```python
-# torch/_inductor/lowering.py: ~L2200
-def fallback_handler(
-    aten_fn: torch._ops.OpOverload,
-    add_to_fallback_set: bool = True,
-) -> Callable[..., Any]:
+# torch/_inductor/lowering.py:2192
+def fallback_handler(kernel, add_to_fallback_set=True):
     """
     创建 Fallback 处理器
     
     当 Inductor 无法处理某算子时，回退到 Aten 实现
     
     Args:
-        aten_fn: 需要 fallback 的算子
+        kernel: 需要 fallback 的算子
         add_to_fallback_set: 是否添加到 fallback 集合
     
     Returns:
         Fallback 处理函数
     """
-    def handler(*args, **kwargs):
-        # 调用 Aten 实现
-        return aten_fn(*args, **kwargs)
-    
     if add_to_fallback_set:
-        fallbacks.add(aten_fn)
-    
+        fallbacks.add(kernel)
+
+    def handler(*args, **kwargs):
+        # 将 IR 节点包装为 TensorBox
+        def wrap_tensors(x):
+            return TensorBox.create(x) if isinstance(x, ir.IRNode) else x
+
+        # 创建 FallbackKernel，实际调用 Aten 实现
+        return pytree.tree_map(
+            wrap_tensors, ir.FallbackKernel.create(kernel, *args, **kwargs)
+        )
+
+    # 标记为 fallback handler，便于调试
+    handler._is_fallback_handler = True  # type: ignore[attr-defined]
+
     return handler
+```
 
+### 8.2 Fallback 触发条件
 
-# 添加到 Fallback 允许列表
+**文件**: `torch/_inductor/graph.py:1683`
+
+```python
+# torch/_inductor/graph.py:1683 (run_node 方法节选)
+def run_node(self, n: torch.fx.Node) -> object:
+    """Lower and execute a single FX node into Inductor IR."""
+    
+    args, kwargs = self.fetch_args_kwargs_from_env(n)
+    
+    # 条件 1: 不支持的数据类型触发 fallback
+    if (
+        n.op == "call_function"
+        and n.target
+        and isinstance(n.target, torch._ops.OpOverload)
+        and torch._library.utils.is_builtin(n.target)
+        and fallback_node_due_to_unsupported_type(n)  # 如 complex, sparse, float8_e8m0fnu
+    ):
+        result = fallback_handler(n.target, add_to_fallback_set=False)(
+            *args, **kwargs
+        )
+    
+    # 条件 2: inductor lite mode 下默认 fallback
+    elif (
+        n.op == "call_function"
+        and isinstance(
+            n.target, (torch._ops.OpOverload, torch._ops.HigherOrderOperator)
+        )
+        and should_fallback_by_default(n)
+    ):
+        result = fallback_handler(n.target, add_to_fallback_set=False)(
+            *args, **kwargs
+        )
+    
+    # 条件 3: 正常路径 - 执行 Lowering 或 Decomposition
+    else:
+        result = super().run_node(n)
+        # 后续处理：channels-last 布局优化、输出 stride 校验等
+        result = maybe_apply_channels_last_stride_order(result, n)
+```
+
+### 8.3 Fallback 允许列表
+
+某些算子默认使用 fallback，而不使用 Inductor 实现：
+
+```python
+# torch/_inductor/lowering.py:106
 FALLBACK_ALLOW_LIST = OrderedSet([
     "torchvision::roi_align",
     "aten::index_add",
 ])
-```
 
-### 8.2 Fallback 决策流程
-
-```python
-# torch/_inductor/graph.py: ~L700
-def run_node(self, node: torch.fx.Node):
-    """
-    FX 节点执行流程
-    """
-    self.current_node = node
-    target = node.target
-    
-    # 1. 查找 Lowering
-    if target in lowerings:
-        lowering = lowerings[target]
-        args, kwargs = self.fetch_args_kwargs_from_env(node)
-        return lowering(*args, **kwargs)
-    
-    # 2. 查找分解
-    if target in decompositions:
-        decomp_fn = decompositions[target]
-        return self.decompose_node(node, decomp_fn)
-    
-    # 3. Fallback
-    if should_fallback(node):
-        return self.fallback_node(node)
-    
-    # 4. 错误
-    raise MissingOperatorWithDecomp(f"No lowering for {target}")
+# torch/_inductor/lowering.py:114-136
+# 明确排除的分解（使用 fallback 或 Inductor 自己的实现）
+decomps_to_exclude = [
+    aten._unsafe_index,
+    aten._scaled_dot_product_flash_attention_for_cpu.default,
+    aten._softmax_backward_data,
+    aten.clamp_max,
+    aten.clamp_min,
+    aten.embedding_dense_backward,  # XPU 需要 fallback
+    aten.native_layer_norm,         # MTIA 需要 fallback
+    aten.index_add,                 # 条件性使用分解
+    aten.glu,                       # Inductor 直接 lowering
+    aten.select_scatter,            # 需要保留在 ATen 图以便 re-inplacing
+    aten.slice_scatter,             # 需要保留在 ATen 图以便 re-inplacing
+    aten.silu,                      # Inductor 使用精确的 eager 分解
+    aten.split.Tensor,              # Inductor 直接 lowering
+    aten.squeeze,                   # Inductor 直接 lowering
+    aten.sum,                       # Inductor 直接 lowering
+    aten.unbind,                    # Inductor 直接 lowering
+    aten.baddbmm,                   # upcast 到 fp32，性能问题
+]
 ```
 
 ---
